@@ -21,12 +21,12 @@ class ShmCache {
     define( 'SHM_CACHE_LONG_SIZE', strlen( pack( 'l', 1 ) ) ); // i.e. sizeof(long) in C
     define( 'SHM_CACHE_CHAR_SIZE', strlen( pack( 'c', 1 ) ) ); // i.e. sizeof(char) in C
 
-    // Cache item's key has a flag (sizeof(char)) for whether the item's space is free.
     // Cache item's key is an MD5 and takes 16 bytes.
+    // Cache item's key has a flag (sizeof(char)) for whether the item's space is free.
     // Cache item's next key offset is a long.
     // Cache item's value size is a long.
     // Cache item's value offset is a long.
-    define( 'SHM_CACHE_ITEM_META_SIZE', SHM_CACHE_CHAR_SIZE + 16 + SHM_CACHE_LONG_SIZE + SHM_CACHE_LONG_SIZE + SHM_CACHE_LONG_SIZE );
+    define( 'SHM_CACHE_ITEM_META_SIZE', 16 + SHM_CACHE_CHAR_SIZE + SHM_CACHE_LONG_SIZE + SHM_CACHE_LONG_SIZE + SHM_CACHE_LONG_SIZE );
     // Cache keys ring buffer pointer is a long. The ring buffer pointer is
     // always the offset of the oldest cache item key.
     define( 'SHM_CACHE_KEYS_START', SHM_CACHE_LONG_SIZE );
@@ -52,7 +52,7 @@ class ShmCache {
       goto error;
 
     $keyMd5 = md5( $key, true );
-    $item = $this->getItemMetaByKeyMd5( $keyMd5 );
+    $item = $this->getItemMetaForMd5Key( $keyMd5 );
 
     if ( $item ) {
       if ( !$this->freeItem( $item ) )
@@ -68,6 +68,8 @@ class ShmCache {
     $replacedItem = $this->getItemMetaByKeyOffset( $oldestKeyPointer );
     if ( !$replacedItem )
       goto error;
+
+    var_dump( $replacedItem );
 
     $newValueSize = strlen( $value );
 
@@ -94,6 +96,9 @@ class ShmCache {
       if ( $nextItem[ 'keyoffset' ] === $replacedItem[ 'keyoffset' ] )
         goto error;
 
+      $replacedItem[ 'valsize' ] += $nextItem[ 'valsize' ];
+      $replacedItem[ 'nextkeyoffset' ] = $nextItem[ 'nextkeyoffset' ];
+
       // Invalidate the cache key
       $nextItem[ 'free' ] = false;
       $nextItem[ 'key' ] = pack( 'x16' );
@@ -103,9 +108,6 @@ class ShmCache {
 
       if ( !$this->updateCacheItemKey( $nextItem ) )
         goto error;
-
-      $replacedItem[ 'valsize' ] += $nextItem[ 'valsize' ];
-      $replacedItem[ 'nextkeyoffset' ] = $nextItem[ 'nextkeyoffset' ];
     }
 
     // Split the cache item into two, if there is enough space left over
@@ -124,7 +126,7 @@ class ShmCache {
 
       if ( !$splitMeta || $splitMeta[ 'valoffset' ] != 0 ) {
         trigger_error( 'DEBUG: could not find a free cache key spot. Might have reached MAX_ITEMS.' );
-        break;
+        goto error;
       }
 
       if ( !$this->createCacheItem( $this->block, $splitMeta[ 'keyoffset' ], true, pack( 'x16' ), $replacedItem[ 'nextkeyoffset' ], $splitValueSize, $splitValueOffset ) )
@@ -164,7 +166,7 @@ class ShmCache {
     if ( !$this->lock() )
       return false;
 
-    $item = $this->getItemMetaByKeyMd5( md5( $key, true ) );
+    $item = $this->getItemMetaForMd5Key( md5( $key, true ) );
 
     if ( !$item )
       $ret = false;
@@ -178,7 +180,7 @@ class ShmCache {
 
   function delete( $key ) {
 
-    $item = $this->getItemMetaByKeyMd5( $keyMd5 );
+    $item = $this->getItemMetaForMd5Key( $keyMd5 );
 
     if ( !$item )
       return false;
@@ -201,10 +203,15 @@ class ShmCache {
 
   private function getRingBufferPointer() {
 
-    $oldestKeyPointer = unpack( 'l', shmop_read( $this->block, 0, SHM_CACHE_LONG_SIZE ) );
+    $oldestKeyPointer = unpack( 'l', shmop_read( $this->block, 0, SHM_CACHE_LONG_SIZE ) )[ 1 ];
+
+    if ( !$oldestKeyPointer ) {
+      trigger_error( 'Could not find the ring buffer pointer' );
+      return null;
+    }
 
     if ( $oldestKeyPointer < SHM_CACHE_KEYS_START || $oldestKeyPointer >= SHM_CACHE_KEYS_START + SHM_CACHE_KEYS_SIZE ) {
-      trigger_error( 'Could not find the ring buffer pointer' );
+      trigger_error( 'The ring buffer pointer is out of bounds' );
       return null;
     }
 
@@ -228,7 +235,7 @@ class ShmCache {
 
   private function updateCacheItemKey( $item ) {
 
-    $data = pack( 'c', (int) $item[ 'free' ] ) . pack( 'c16', $item[ 'key' ] ) . pack( 'l', $item[ 'nextkeyoffset' ] ) . pack( 'l', $item[ 'valsize' ] ) . pack( 'l', $item[ 'valoffset' ] );
+    $data = $item[ 'key' ] . pack( 'c', (int) $item[ 'free' ] ) . pack( 'l', $item[ 'nextkeyoffset' ] ) . pack( 'l', $item[ 'valsize' ] ) . pack( 'l', $item[ 'valoffset' ] );
 
     if ( shmop_write( $this->block, $data, $item[ 'keyoffset' ] ) === false ) {
       trigger_error( 'Could not update cache item' );
@@ -238,7 +245,17 @@ class ShmCache {
     return true;
   }
 
-  private function getItemMetaByKeyMd5( $keyMd5 ) {
+  private function createCacheItem( $block, $keyOffset, $isFree, $keyMd5, $nextKeyOffset, $valueSize, $valueOffset ) {
+
+    if ( strlen( $keyMd5 ) !== 16 )
+      throw new \InvalidArgumentException( 'Given MD5 key must be in binary, i.e. 16 bits wide' );
+
+    $data = $keyMd5 . pack( 'c', (int) $isFree ) . pack( 'l', $nextKeyOffset ) . pack( 'l', $valueSize ) . pack( 'l', $valueOffset );
+
+    return ( shmop_write( $block, $data, $keyOffset ) !== false );
+  }
+
+  private function getItemMetaForMd5Key( $keyMd5 ) {
 
     if ( strlen( $keyMd5 ) !== 16 )
       throw new \InvalidArgumentException( 'Given MD5 key must be in binary, i.e. 16 bits wide' );
@@ -252,8 +269,20 @@ class ShmCache {
       if ( !$meta )
         return null;
 
-      if ( !$meta[ 'free' ] && $meta[ 'key' ] === $keyMd5 )
+      if ( !$meta[ 'free' ] && $meta[ 'key' ] === $keyMd5 ) {
+
+        if ( !$unpacked[ 'valsize' ] ) {
+          trigger_error( 'Could not determine the size of an item in the memory block. This should not happen.' );
+          return null;
+        }
+
+        if ( !$unpacked[ 'valoffset' ] ) {
+          trigger_error( 'Could not determine the offset of an item in the memory block. This should not happen.' );
+          return null;
+        }
+
         return $meta;
+      }
 
       $keyOffset = $meta[ 'nextkeyoffset' ];
     }
@@ -275,19 +304,10 @@ class ShmCache {
       return null;
     }
 
-    $unpacked = unpack( 'c1free/c16key/lnextkeyoffset/lvalsize/lvaloffset', $data );
-
-    if ( !$unpacked[ 'valsize' ] ) {
-      trigger_error( 'Could not determine the size of an item in the memory block. This should not happen.' );
-      return null;
-    }
-
-    if ( !$unpacked[ 'valoffset' ] ) {
-      trigger_error( 'Could not determine the offset of an item in the memory block. This should not happen.' );
-      return null;
-    }
-
+    $unpacked = unpack( 'cfree/lnextkeyoffset/lvalsize/lvaloffset', $data );
     $unpacked[ 'keyoffset' ] = $keyOffset;
+
+    var_dump( $unpacked );
 
     return $unpacked;
   }
@@ -395,17 +415,31 @@ class ShmCache {
     $valueSize = SHM_CACHE_VALUES_SIZE;
     $valueOffset = SHM_CACHE_VALUES_START;
 
-    $this->createCacheItem( $block, SHM_CACHE_KEYS_START, $isFree, $keyMd5, $nextKeyOffset, $valueSize, $valueOffset );
+    if ( !$this->createCacheItem( $block, SHM_CACHE_KEYS_START, $isFree, $keyMd5, $nextKeyOffset, $valueSize, $valueOffset ) )
+      trigger_error( 'Could not create initial cache item' );
   }
 
-  private function createCacheItem( $block, $keyOffset, $isFree, $keyMd5, $nextKeyOffset, $valueSize, $valueOffset ) {
+  function dumpKeyAreaDebug() {
 
-    if ( strlen( $keyMd5 ) !== 16 )
-      throw new \InvalidArgumentException( 'Given MD5 key must be in binary, i.e. 16 bits wide' );
+    echo 'Ring buffer pointer: '. unpack( 'l', shmop_read( $this->block, 0, SHM_CACHE_KEYS_START ) )[ 1 ] . PHP_EOL;
+    echo PHP_EOL;
+    echo 'Items in cache:'. PHP_EOL . PHP_EOL;
 
-    $data = pack( 'c', (int) $isFree ) . $keyMd5 . pack( 'l', $nextKeyOffset ) . pack( 'l', $valueSize ) . pack( 'l', $valueOffset );
+    for ( $i = SHM_CACHE_KEYS_START; $i < SHM_CACHE_KEYS_START + SHM_CACHE_KEYS_SIZE; $i += SHM_CACHE_ITEM_META_SIZE ) {
 
-    return ( shmop_write( $block, $data, $keyOffset ) !== false );
+      $item = $this->getItemMetaByKeyOffset( $i );
+
+      if ( $item && $item[ 'valsize' ] ) {
+        echo 'Item (keyoffset: '. $item[ 'keyoffset' ] .', nextkeyoffset: '. $item[ 'nextkeyoffset' ] .', valoffset: '. $item[ 'valoffset' ] .', size: '. $item[ 'valsize' ] .')'. PHP_EOL;
+        if ( $item[ 'free' ] )
+          echo '    [Free space]';
+        else
+          echo '    "'. shmop_read( $this->block, $item[ 'valoffset' ], $item[ 'valsize' ] ) .'"';
+        echo PHP_EOL;
+      }
+    }
+
+    echo PHP_EOL;
   }
 }
 
@@ -415,13 +449,18 @@ ini_set('display_startup_errors', 1);
 error_reporting(E_ALL);
 
 $cache = new ShmCache();
+
 $cache->deleteAll();
+echo 'Deleted all'. PHP_EOL;
+
 $key = 'blaa';
 $value = $cache->get( $key );
+echo 'Old value: '. var_export( $value, true ) . PHP_EOL;
 $num = ( $value ) ? intval( $value ) : 0;
 
-echo 'Old value: '. $value . PHP_EOL;
-
 if ( !$cache->set( $key, ( $num + 1 ) .' foo' ) )
-  throw new \Exception( 'Could not write the shared memory variable "'. $key .'"' );
+  echo 'Failed setting value'. PHP_EOL;
+
+echo '---------------------------------------'. PHP_EOL;
+echo 'Debug:'. PHP_EOL;
 
