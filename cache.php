@@ -1,5 +1,18 @@
 <?php
 
+/*
+
+Requirements:
+
+- FIFO queue: oldest element is evicted first
+- Hash table size should be a prime (_not_ a power of 2) to disperse keys evenly
+
+[bufferPtr,[key,isFree,next,valSize,valOffset],[key,isFree,next,valSize,valOffset],...]
+[SAFE AREA]
+[val1,val2,val3,...]
+
+*/
+
 class ShmCache {
 
   const MEM_BLOCK_SIZE = 130000000;
@@ -478,27 +491,10 @@ ini_set('display_startup_errors', 1);
 error_reporting(E_ALL);
 
 
-$a = [];
-for ( $i = 0; $i < ShmCache::MAX_ITEMS; ++$i ) {
-  $a[ md5( $i, true ) ] = 134217728;
-}
-$start = microtime( true );
-$serialized = serialize( $a );
-$time = microtime( true ) - $start;
-$start = microtime( true );
-$unserialized = unserialize( $serialized );
-$time2 = microtime( true ) - $start;
-echo 'Keeping a serialized string of all MD5 keys and their memory offsets would take '. strlen( $serialized ) .' bytes.'. PHP_EOL;
-echo 'Serializing that takes '. $time .' sec. Unserializing takes '. $time2 .' sec.'. PHP_EOL;
-echo PHP_EOL;
-
-
-$memcached = new \Memcached();
-$memcached->addServer( 'localhost', 11211 );
 $cache = new ShmCache();
 
 if ( $argc > 1 && $argv[ 1 ] === 'clear' ) {
-  if ( $memcached->flush() && $cache->deleteAll() )
+  if ( $cache->deleteAll() )
     echo 'Deleted all'. PHP_EOL;
   else
     echo 'ERROR: Failed to delete all'. PHP_EOL;
@@ -514,13 +510,6 @@ for ( $i = 0; $i < 2000; ++$i ) {
     break;
   }
   echo 'ShmCache took '. ( microtime( true ) - $start ) .' s'. PHP_EOL;
-
-  $start = microtime( true );
-  if ( !$memcached->set( 'foobar'. $i, rand() .' '. str_repeat( 'x', 10 ) ) ) {
-    echo 'ERROR: Failed setting Memcached value '. $i . PHP_EOL;
-    break;
-  }
-  echo 'Memcached took '. ( microtime( true ) - $start ) .' s'. PHP_EOL;
 }
 
 for ( $i = 0; $i < 2000; ++$i ) {
@@ -533,13 +522,6 @@ for ( $i = 0; $i < 2000; ++$i ) {
     break;
   }
   echo 'ShmCache took '. ( microtime( true ) - $start ) .' s'. PHP_EOL;
-
-  $start = microtime( true );
-  if ( !$memcached->get( 'foobar'. $i ) ) {
-    echo 'ERROR: Failed getting Memcached value '. $i . PHP_EOL;
-    break;
-  }
-  echo 'Memcached took '. ( microtime( true ) - $start ) .' s'. PHP_EOL;
 }
 
 $value = $cache->get( 'foobar0' );
@@ -552,3 +534,4 @@ $num = ( $value ) ? intval( $value ) : 0;
 echo '---------------------------------------'. PHP_EOL;
 echo 'Debug:'. PHP_EOL;
 //$cache->dumpKeyAreaDebug();
+
