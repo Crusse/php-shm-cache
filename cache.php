@@ -21,8 +21,12 @@
  *     the oldest items are removed one by one when adding a new item, until
  *     there is enough space for the new item.
  * 
- * Keys area (MAX_ITEMS hash table slots):
+ * Keys area:
  * [itemMetaOffset,itemMetaOffset,...]
+ *
+ *     The keys area is a hash table of SHM_CACHE_KEYS_SLOTS items. Our hash
+ *     table implementation uses linear probing, so this table is ever filled
+ *     up to MAX_LOAD_FACTOR.
  * 
  * Values area:
  * [[key,valSize,value],...]
@@ -44,8 +48,8 @@ class ShmCache {
   // Don't let value allocations become smaller than this, to reduce fragmentation
   const MIN_VALUE_SIZE = 32;
   const MAX_VALUE_SIZE = 1048576; // 1 MB
-  // Hash table size should be a prime (_not_ a power of 2) to disperse keys evenly
-  const MAX_ITEMS = 20011;
+  const MAX_ITEMS = 20000;
+  const FULL_CACHE_REMOVED_ITEMS = 10;
   // Use a low load factor (i.e. make there be many more slots in the hash
   // table than the maximum amount of items we'll be storing). 0.5 or less.
   const MAX_LOAD_FACTOR = 0.5;
@@ -93,11 +97,12 @@ class ShmCache {
     // FIFO area
     $itemCountSize = SHM_CACHE_LONG_SIZE;
     $ringBufferPtrSize = SHM_CACHE_LONG_SIZE;
+    define( 'SHM_CACHE_FIFO_AREA_START', 0 );
     define( 'SHM_CACHE_FIFO_AREA_SIZE', $itemCountSize + $ringBufferPtrSize );
 
     // Keys area (i.e. cache item hash table)
     define( 'SHM_CACHE_KEYS_SLOTS', ceil( self::MAX_ITEMS / self::MAX_LOAD_FACTOR ) );
-    define( 'SHM_CACHE_KEYS_START', SHM_CACHE_FIFO_AREA_SIZE + self::SAFE_AREA_SIZE );
+    define( 'SHM_CACHE_KEYS_START', SHM_CACHE_FIFO_AREA_START + SHM_CACHE_FIFO_AREA_SIZE + self::SAFE_AREA_SIZE );
     // The hash table values are "pointers", i.e. offsets to the values area
     define( 'SHM_CACHE_KEYS_SIZE', SHM_CACHE_KEYS_SLOTS * SHM_CACHE_LONG_SIZE );
 
@@ -143,10 +148,18 @@ class ShmCache {
     $nextOffset = $replacedItem[ 'nextoffset' ];
     $allocatedSize = $replacedItem[ 'valallocsize' ];
 
+    // When the maximum amount of cached items is reached, we start removing
+    // the oldest items. We don't remove just one, but multiple at once, so
+    // that any calls to set() afterwards will not immediately have to remove
+    // an item again.
+    $extraItemsToRemove = 0;
+    if ( $this->getItemCount() >= self::MAX_ITEMS )
+      $extraItemsToRemove = self::FULL_CACHE_REMOVED_ITEMS;
+
     // The new value doesn't fit into an existing cache item. Make space for the
     // new value by merging next oldest cache items one by one into the current
     // cache item, until we have enough space.
-    while ( $allocatedSize < $newValueSize ) {
+    while ( $allocatedSize < $newValueSize || $extraItemsToRemove-- > 0 ) {
 
       // Loop around if we reached the end of the cache keys memory area
       if ( !$nextOffset ) {
@@ -188,7 +201,6 @@ class ShmCache {
 
     if ( !$this->writeItemMeta( $itemOffset, $key, $allocatedSize, $newValueSize ) )
       goto error;
-
     if ( !$this->writeItemValue( $itemOffset + SHM_CACHE_ITEM_META_SIZE, $value ) )
       goto error;
 
@@ -208,7 +220,8 @@ class ShmCache {
     if ( !$this->setRingBufferPointer( $newBufferPtr ) )
       goto error;
 
-    $this->setItemCount( $this->getItemCount() + 1 );
+    if ( !$existingItem )
+      $this->setItemCount( $this->getItemCount() + 1 );
 
     $this->releaseLock();
     return true;
@@ -231,7 +244,7 @@ class ShmCache {
     if ( !$item )
       $ret = false;
     else
-      $ret = shmop_read( $this->block, $item[ 'offset' ], $item[ 'valsize' ] );
+      $ret = shmop_read( $this->block, $item[ 'offset' ] + SHM_CACHE_ITEM_META_SIZE, $item[ 'valsize' ] );
 
     $this->releaseLock();
 
@@ -341,12 +354,40 @@ class ShmCache {
       return false;
     }
 
+    // Get the last key in this contiguous chain of keys, and move it to fill
+    // the spot left by removing this key. All the hash table's items for
+    // a specific $item['key'] must form a contiguous run of memory.
+
+    $lastKeyOffset = 0;
+    $lastKeyValue = 0;
+    $nextKeyOffset = $keyOffset;
+
+    for ( $i = 0; $i < SHM_CACHE_KEYS_SLOTS; ++$i ) {
+      $nextKeyOffset = ( $nextKeyOffset + SHM_CACHE_LONG_SIZE ) % SHM_CACHE_KEYS_SLOTS;
+      $data = shmop_read( $this->block, $nextKeyOffset, SHM_CACHE_LONG_SIZE );
+      $lastKeyValue = unpack( 'l', $data )[ 1 ];
+      // Found a null hash table item
+      if ( $lastKeyValue === 0 )
+        break;
+      $lastKeyOffset = $nextOffset;
+    }
+
+    if ( !$lastKeyOffset || !$lastKeyValue ) {
+      trigger_error( 'Could not find the last item in the hash table cluster for item "'. $item[ 'key' ] .'"' );
+      return false;
+    }
+
+    if ( !$this->writeItemKey( $lastKeyOffset, 0 ) )
+      return false;
+    if ( !$this->writeItemKey( $keyOffset, $lastKeyValue ) )
+      return false;
+
     return $this->setItemCount( $this->getItemCount() - 1 );
   }
 
   private function getItemCount() {
 
-    $data = shmop_read( $this->block, 0, SHM_CACHE_LONG_SIZE );
+    $data = shmop_read( $this->block, SHM_CACHE_FIFO_AREA_START, SHM_CACHE_LONG_SIZE );
 
     if ( $data === false ) {
       trigger_error( 'Could not read the item count' );
@@ -358,7 +399,12 @@ class ShmCache {
 
   private function setItemCount( $count ) {
 
-    if ( shmop_write( $this->block, pack( 'l', $count ), 0 ) === false ) {
+    if ( $count < 0 ) {
+      trigger_error( 'Item count must be 0 or larger' );
+      return;
+    }
+
+    if ( shmop_write( $this->block, pack( 'l', $count ), SHM_CACHE_FIFO_AREA_START ) === false ) {
       trigger_error( 'Could not write the item count' );
       return false;
     }
@@ -368,7 +414,8 @@ class ShmCache {
 
   private function getRingBufferPointer() {
 
-    $oldestKeyPointer = unpack( 'l', shmop_read( $this->block, SHM_CACHE_LONG_SIZE, SHM_CACHE_LONG_SIZE ) )[ 1 ];
+    $oldestKeyPointer = unpack( 'l', shmop_read( $this->block,
+      SHM_CACHE_FIFO_AREA_START + SHM_CACHE_LONG_SIZE, SHM_CACHE_LONG_SIZE ) )[ 1 ];
 
     if ( !$oldestKeyPointer ) {
       trigger_error( 'Could not find the ring buffer pointer' );
@@ -385,7 +432,7 @@ class ShmCache {
 
   private function setRingBufferPointer( $keyOffset ) {
 
-    if ( shmop_write( $this->block, pack( 'l', $keyOffset ), SHM_CACHE_LONG_SIZE ) === false ) {
+    if ( shmop_write( $this->block, pack( 'l', $keyOffset ), SHM_CACHE_FIFO_AREA_START + SHM_CACHE_LONG_SIZE ) === false ) {
       trigger_error( 'Could not write the ring buffer pointer' );
       return false;
     }
@@ -482,7 +529,7 @@ class ShmCache {
 
       $index = ( $index + 1 ) % SHM_CACHE_KEYS_SLOTS;
     }
-    while ( unpack( 'l', $data ) !== 0 );
+    while ( unpack( 'l', $data )[ 1 ] !== 0 );
 
     return $this->writeItemKey( $keyOffset, $itemMetaOffset );
   }
@@ -611,7 +658,7 @@ class ShmCache {
   private function initializeMemBlock( $block ) {
 
     // Clear all bytes in the shared memory block
-    $memoryWriteChunk = 1024 * 1024 * 8;
+    $memoryWriteChunk = 1024 * 1024 * 4;
     for ( $i = 0; $i < self::MEM_BLOCK_SIZE; $i += $memoryWriteChunk ) {
 
       // Last chunk might have to be smaller
@@ -625,22 +672,17 @@ class ShmCache {
     // The ring buffer pointer always points to the oldest cache item. In this
     // case it's the first key of the new memory block, which itself points to
     // free space of the values area.
-    $this->setRingBufferPointer( SHM_CACHE_KEYS_START );
+    $this->setRingBufferPointer( SHM_CACHE_VALUES_START );
+    $this->setItemCount( 0 );
 
     // Initialize first cache item
-    $isFree = true;
-    $keyMd5 = pack( 'x16' );
-    $nextKeyOffset = 0;
-    $valueSize = SHM_CACHE_VALUES_SIZE;
-    $valueOffset = SHM_CACHE_VALUES_START;
-
-    if ( !$this->createCacheItem( $block, SHM_CACHE_KEYS_START, $keyMd5, $isFree, $nextKeyOffset, $valueSize, $valueOffset ) )
+    if ( !$this->writeItemMeta( SHM_CACHE_VALUES_START, '', SHM_CACHE_VALUES_SIZE, 0 ) )
       trigger_error( 'Could not create initial cache item' );
   }
 
   function dumpKeyAreaDebug() {
 
-    echo 'Ring buffer pointer: '. unpack( 'l', shmop_read( $this->block, 0, SHM_CACHE_KEYS_START ) )[ 1 ] . PHP_EOL;
+    echo 'Ring buffer pointer: '. $this->getRingBufferPointer() . PHP_EOL;
     echo 'Items in cache:'. PHP_EOL;
 
     for ( $i = SHM_CACHE_KEYS_START; $i < SHM_CACHE_KEYS_START + SHM_CACHE_KEYS_SIZE; $i += SHM_CACHE_ITEM_META_SIZE ) {
