@@ -182,7 +182,7 @@ class ShmCache {
         $firstItem = $this->getItemMetaByOffset( SHM_CACHE_VALUES_START );
         if ( !$firstItem )
           goto error;
-        $itemOffset = SHM_CACHE_KEYS_START;
+        $itemOffset = SHM_CACHE_VALUES_START;
         $nextOffset = $firstItem[ 'nextoffset' ];
         $allocatedSize = $firstItem[ 'valallocsize' ];
         continue;
@@ -348,13 +348,11 @@ class ShmCache {
    */
   private function removeItem( $item ) {
 
-    echo 'Remove '. $item[ 'key' ] . PHP_EOL;
-
     // Item is already free'd
     if ( $item[ 'free' ] )
       return false;
 
-    $hashTableOffset = $this->getHashTableOffset( $item[ 'key' ] );
+    $hashTableOffset = $this->getHashTableOffsetByKey( $item[ 'key' ] );
 
     // Key doesn't exist in the hash table. This item was probably already
     // removed, or never existed.
@@ -388,19 +386,25 @@ class ShmCache {
       // Found a null hash table item
       if ( $itemMetaOffset === 0 )
         break;
+      $lastHashTableOffset = $nextHashTableOffset;
       $lastItemMetaOffset = $itemMetaOffset;
-      $lastHashTableOffset = $nextOffset;
     }
 
-    if ( !$lastHashTableOffset || !$lastItemMetaOffset ) {
-      trigger_error( 'Could not find the last item in the hash table cluster for item "'. $item[ 'key' ] .'"' );
-      return false;
-    }
+    // There are multiple keys in this hash table "bucket" for this key. The
+    // last key will be moved to fill the spot left by the now-removed key.
+    if ( $lastHashTableOffset ) {
+      
+      if ( !$lastItemMetaOffset ) {
+        trigger_error( 'Could not find the metadata for the last item in the hash table cluster for key "'. $item[ 'key' ] .'"' );
+        return false;
+      }
 
-    if ( !$this->writeItemKey( $lastHashTableOffset, 0 ) )
-      return false;
-    if ( !$this->writeItemKey( $hashTableOffset, $lastItemMetaOffset ) )
-      return false;
+      if ( !$this->writeItemKey( $hashTableOffset, $lastItemMetaOffset ) )
+        return false;
+
+      if ( !$this->writeItemKey( $lastHashTableOffset, 0 ) )
+        return false;
+    }
 
     return $this->setItemCount( $this->getItemCount() - 1 );
   }
@@ -420,6 +424,7 @@ class ShmCache {
   private function setItemCount( $count ) {
 
     if ( $count < 0 ) {
+      throw new Exception( 'aa' );
       trigger_error( 'Item count must be 0 or larger' );
       return;
     }
@@ -488,26 +493,28 @@ class ShmCache {
   private function getItemMetaByKey( $key ) {
 
     $index = $this->getHashIndex( $key );
-    $offset = $this->getItemMetaOffsetByHashIndex( $index );
+    $metaOffset = $this->getItemMetaOffsetByHashIndex( $index );
 
-    if ( !$offset ) {
+    if ( !$metaOffset ) {
       $ret = null;
     }
     else {
 
-      $item = $this->getItemMetaByOffset( $offset );
+      $item = $this->getItemMetaByOffset( $metaOffset );
       $ret = null;
 
       while ( $item ) {
+        // FIXME: fix an infinite loop here
+        echo $item[ 'key' ] . PHP_EOL;
         if ( $item[ 'key' ] === $key ) {
           $ret = $item;
           break;
         }
         $index = ( $index + 1 ) % SHM_CACHE_KEYS_SLOTS;
-        $offset = $this->getItemMetaOffsetByHashIndex( $index );
-        if ( !$offset )
+        $metaOffset = $this->getItemMetaOffsetByHashIndex( $index );
+        if ( !$metaOffset )
           break;
-        $item = $this->getItemMetaByOffset( $offset );
+        $item = $this->getItemMetaByOffset( $metaOffset );
       }
     }
 
@@ -515,6 +522,11 @@ class ShmCache {
   }
 
   private function getItemMetaByOffset( $offset ) {
+
+    if ( $offset < SHM_CACHE_VALUES_START || $offset >= SHM_CACHE_VALUES_START + SHM_CACHE_VALUES_SIZE ) {
+      trigger_error( 'Invalid offset '. $offset );
+      return null;
+    }
 
     $data = shmop_read( $this->block, $offset, SHM_CACHE_ITEM_META_SIZE );
 
@@ -539,8 +551,27 @@ class ShmCache {
     return $unpacked;
   }
 
+  private function getHashTableOffsetByKey( $key ) {
+
+    $index = $this->getHashIndex( $key );
+    $metaOffset = $this->getItemMetaOffsetByHashIndex( $index );
+
+    while ( $metaOffset ) {
+      $item = $this->getItemMetaByOffset( $metaOffset );
+      if ( !$item )
+        break;
+      if ( $item[ 'key' ] === $key )
+        return SHM_CACHE_KEYS_START + $index * SHM_CACHE_LONG_SIZE;
+      $index = ( $index + 1 ) % SHM_CACHE_KEYS_SLOTS;
+      $metaOffset = $this->getItemMetaOffsetByHashIndex( $index );
+    }
+
+    return 0;
+  }
+
   private function addItemKey( $key, $itemMetaOffset ) {
 
+    $i = 0;
     $index = $this->getHashIndex( $key );
 
     do {
@@ -553,20 +584,20 @@ class ShmCache {
         return false;
       }
 
+      $hashTableValue = unpack( 'l', $data )[ 1 ];
       $index = ( $index + 1 ) % SHM_CACHE_KEYS_SLOTS;
     }
-    while ( unpack( 'l', $data )[ 1 ] !== 0 );
+    while ( $hashTableValue !== 0 && ++$i < SHM_CACHE_KEYS_SLOTS );
 
     return $this->writeItemKey( $hashTableOffset, $itemMetaOffset );
   }
 
   private function updateItemKey( $key, $itemMetaOffset ) {
 
-    echo 'Update'. PHP_EOL;
-    $hashTableOffset = $this->getHashTableOffset( $key );
+    $hashTableOffset = $this->getHashTableOffsetByKey( $key );
 
     if ( !$hashTableOffset ) {
-      trigger_error( 'Could not get key offset for key "'. $key .'"' );
+      trigger_error( 'Could not get hash table offset for key "'. $key .'"' );
       return false;
     }
 
@@ -581,23 +612,6 @@ class ShmCache {
     }
 
     return true;
-  }
-
-  private function getHashTableOffset( $key ) {
-
-    $index = $this->getHashIndex( $key );
-    $offset = SHM_CACHE_KEYS_START + $index * SHM_CACHE_LONG_SIZE;
-    $item = $this->getItemMetaByOffset( $offset );
-
-    while ( $item ) {
-      if ( $item[ 'key' ] === $key )
-        return $offset;
-      $index = ( $index + 1 ) % SHM_CACHE_KEYS_SLOTS;
-      $offset = SHM_CACHE_KEYS_START + $index * SHM_CACHE_LONG_SIZE;
-      $item = $this->getItemMetaByOffset( $offset );
-    }
-
-    return 0;
   }
 
   private function lock() {
