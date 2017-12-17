@@ -17,13 +17,13 @@ for ( $i = 0; $i < floor( $memSize / $elemSize ); ++$i ) {
 }
 
 $time = 0;
-for ( $i = 0; $i < $memSize; $i += $elemSize ) {
+for ( $i = $memSize - $elemSize; $i >= 0; $i -= $elemSize ) {
   $start = microtime( true );
-  (int) ( shmop_read( $block1, $i, $elemSize ) );
+  (int) ( shmop_read( $block2, $i, $elemSize ) );
   $time += ( microtime( true ) - $start );
 }
-echo 'Forwards: '. $time .' s'. PHP_EOL;
-shmop_delete( $block1 );
+echo 'Backwards: '. $time .' s'. PHP_EOL;
+shmop_delete( $block2 );
 
 $randOffsets = [];
 for ( $i = 0; $i < floor( $memSize / $elemSize ); ++$i )
@@ -38,12 +38,12 @@ echo 'Random: '. $time .' s'. PHP_EOL;
 shmop_delete( $block3 );
 
 $time = 0;
-for ( $i = $memSize - $elemSize; $i >= 0; $i -= $elemSize ) {
+for ( $i = 0; $i < $memSize; $i += $elemSize ) {
   $start = microtime( true );
-  (int) ( shmop_read( $block2, $i, $elemSize ) );
+  (int) ( shmop_read( $block1, $i, $elemSize ) );
   $time += ( microtime( true ) - $start );
 }
-echo 'Backwards: '. $time .' s'. PHP_EOL;
-shmop_delete( $block2 );
+echo 'Forwards: '. $time .' s'. PHP_EOL;
+shmop_delete( $block1 );
 
 
