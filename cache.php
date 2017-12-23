@@ -46,10 +46,10 @@ class ShmCache {
   const MEM_BLOCK_SIZE = 130000000;
   const SAFE_AREA_SIZE = 64;
   // Don't let value allocations become smaller than this, to reduce fragmentation
-  const MIN_VALUE_SIZE = 32;
+  const MIN_VALUE_SIZE = 64;
   const MAX_VALUE_SIZE = 1048576; // 1 MB
   const MAX_ITEMS = 50;
-  const FULL_CACHE_REMOVED_ITEMS = 5;
+  const FULL_CACHE_REMOVED_ITEMS = 10;
   // Use a low load factor (i.e. make there be many more slots in the hash
   // table than the maximum amount of items we'll be storing). 0.5 or less.
   const MAX_LOAD_FACTOR = 0.5;
@@ -804,31 +804,39 @@ if ( $argc > 1 && $argv[ 1 ] === 'clear' ) {
 }
 
 $itemsToCreate = 2000;
+$totalSetTimeShm = 0;
+$totalSetTimeMemcached = 0;
 
 for ( $i = 0; $i < $itemsToCreate; ++$i ) {
 
   echo 'Set foobar'. $i . PHP_EOL;
   $valuePre = rand();
-  $valuePost = str_repeat( 'x', 10 );
+  $valuePost = str_repeat( 'x', 1000 );
 
   $start = microtime( true );
   if ( !$cache->set( 'foobar'. $i, $valuePre .' '. $valuePost ) ) {
     echo 'ERROR: Failed setting ShmCache value foobar'. $i . PHP_EOL;
     break;
   }
-  echo 'ShmCache took '. ( microtime( true ) - $start ) .' s'. PHP_EOL;
+  $end = ( microtime( true ) - $start );
+  echo 'ShmCache took '. $end .' s'. PHP_EOL;
+  $totalSetTimeShm += $end;
 
-  $start = microtime( true );
+  $start2 = microtime( true );
   if ( !$memcached->set( 'foobar'. $i, $valuePre .' '. $valuePost ) ) {
     echo 'ERROR: Failed setting Memcached value foobar'. $i . PHP_EOL;
     break;
   }
-  echo 'Memcached took '. ( microtime( true ) - $start ) .' s'. PHP_EOL;
+  $end2 = ( microtime( true ) - $start2 );
+  echo 'Memcached took '. $end2 .' s'. PHP_EOL;
+  $totalSetTimeMemcached += $end2;
 }
 
 $start = ( ShmCache::MAX_ITEMS >= $itemsToCreate )
   ? 0
   : $itemsToCreate - ShmCache::MAX_ITEMS;
+$totalGetTimeShm = 0;
+$totalGetTimeMemcached = 0;
 
 for ( $i = $start; $i < $itemsToCreate; ++$i ) {
 
@@ -839,15 +847,30 @@ for ( $i = $start; $i < $itemsToCreate; ++$i ) {
     echo 'ERROR: Failed getting ShmCache value foobar'. $i . PHP_EOL;
     break;
   }
-  echo 'ShmCache took '. ( microtime( true ) - $start ) .' s'. PHP_EOL;
+  $end = ( microtime( true ) - $start );
+  echo 'ShmCache took '. $end .' s'. PHP_EOL;
+  $totalGetTimeShm += $end;
 
-  $start = microtime( true );
+  $start2 = microtime( true );
   if ( !$memcached->get( 'foobar'. $i ) ) {
     echo 'ERROR: Failed getting Memcached value foobar'. $i . PHP_EOL;
     break;
   }
-  echo 'Memcached took '. ( microtime( true ) - $start ) .' s'. PHP_EOL;
+  $end2 = ( microtime( true ) - $start2 );
+  echo 'Memcached took '. $end2 .' s'. PHP_EOL;
+  $totalGetTimeMemcached += $end2;
 }
+
+echo PHP_EOL;
+echo '----------------------------------------------'. PHP_EOL;
+echo 'Total set:'. PHP_EOL;
+echo 'ShmCache:  '. $totalSetTimeShm .' s'. PHP_EOL;
+echo 'Memcached: '. $totalSetTimeMemcached .' s'. PHP_EOL . PHP_EOL;
+
+echo 'Total get:'. PHP_EOL;
+echo 'ShmCache:  '. $totalGetTimeShm .' s'. PHP_EOL;
+echo 'Memcached: '. $totalGetTimeMemcached .' s'. PHP_EOL;
+echo '----------------------------------------------'. PHP_EOL . PHP_EOL;
 
 $value = $cache->get( 'foobar'. ( $itemsToCreate - 1 ) );
 echo 'Old value: '. var_export( $value, true ) . PHP_EOL;
