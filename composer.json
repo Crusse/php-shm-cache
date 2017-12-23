@@ -1,0 +1,25 @@
+{
+  "name": "crusse/shm-cache",
+  "description": "A PHP caching library that stores data in shared memory",
+  "version": "1.0.0",
+  "require": {
+    "php": ">=5.4",
+    "symfony/process": "^2.6"
+  },
+	"require-dev": {
+		"crusse/job-server": "dev-master"
+	},
+  "repositories": [
+    {
+      "url": "https://github.com/Crusse/php-job-server.git",
+      "type": "vcs"
+    }
+  ],
+  "autoload": {
+    "psr-4": {
+      "Crusse\\": "src/Crusse"
+    }
+  },
+  "type": "library"
+}
+
