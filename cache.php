@@ -29,10 +29,12 @@
  *     up to MAX_LOAD_FACTOR.
  * 
  * Values area:
- * [[key,valSize,value],...]
+ * [[key,valAllocSize,valSize,value],...]
  *
  *     'key' is the original key string. If 'key' is NULL, that value slot is
  *     free. The ring buffer pointer points to the oldest value slot.
+ *
+ *     SHM_CACHE_ITEM_META_SIZE = sizeof(key) + sizeof(valAllocSize) + sizeof(valSize)
  *
  *     The value slots are always in the order in which they were added to the
  *     cache, so that we can remove the oldest items when the cache gets full.
@@ -139,6 +141,7 @@ class ShmCache {
       // by the ring buffer pointer).
       else {
         $this->removeItem( $existingItem );
+        $this->mergeItemWithNextFreeValueSlots( $existingItem[ 'offset' ] );
         $existingItem = null;
       }
     }
@@ -184,6 +187,11 @@ class ShmCache {
         if ( $removedOffset === $replacedItem[ 'offset' ] )
           break;
       }
+
+      $this->mergeItemWithNextFreeValueSlots( $replacedItem[ 'offset' ] );
+      // Looped around to the start of the values memory area
+      if ( $removedOffset <= $replacedItem[ 'offset' ] )
+        $this->mergeItemWithNextFreeValueSlots( SHM_CACHE_VALUES_START );
     }
 
     $itemOffset = $replacedItem[ 'offset' ];
@@ -200,6 +208,7 @@ class ShmCache {
         // We'll free the old item at the end of the values area, as we don't
         // wrap items around. Each item is a contiguous run of memory.
         $this->removeItem( $replacedItem );
+        $this->mergeItemWithNextFreeValueSlots( $replacedItem[ 'offset' ] );
         $firstItem = $this->getItemMetaByOffset( SHM_CACHE_VALUES_START );
         if ( !$firstItem )
           goto error;
@@ -302,10 +311,13 @@ class ShmCache {
 
     $item = $this->getItemMetaByKey( $key );
 
-    if ( !$item )
+    if ( !$item ) {
       $ret = false;
-    else
+    }
+    else {
       $ret = $this->removeItem( $item );
+      $this->mergeItemWithNextFreeValueSlots( $item[ 'offset' ] );
+    }
 
     $this->releaseLock();
 
@@ -441,6 +453,27 @@ class ShmCache {
     return $this->setItemCount( $this->getItemCount() - 1 );
   }
 
+  private function mergeItemWithNextFreeValueSlots( $itemOffset ) {
+
+    $item = $this->getItemMetaByOffset( $itemOffset );
+    $nextOffset = $item[ 'nextoffset' ];
+    $allocSize = $item[ 'valallocsize' ];
+
+    while ( $nextOffset ) {
+      $nextItem = $this->getItemMetaByOffset( $nextOffset );
+      if ( !$nextItem[ 'free' ] )
+        break;
+      echo 'merging '. $nextOffset . PHP_EOL;
+      $nextOffset = $nextItem[ 'nextoffset' ];
+      $allocSize += SHM_CACHE_ITEM_META_SIZE + $nextItem[ 'valallocsize' ];
+    }
+
+    if ( $allocSize !== $item[ 'valallocsize' ] ) {
+      echo 'REALLY merging '. $item[ 'offset' ] . PHP_EOL;
+      $this->writeItemMeta( $item[ 'offset' ], null, $allocSize );
+    }
+  }
+
   private function getItemCount() {
 
     $data = shmop_read( $this->block, SHM_CACHE_FIFO_AREA_START, SHM_CACHE_LONG_SIZE );
@@ -496,7 +529,7 @@ class ShmCache {
     return true;
   }
 
-  private function writeItemMeta( $offset, $key, $valueAllocatedSize, $valueSize ) {
+  private function writeItemMeta( $offset, $key = null, $valueAllocatedSize = null, $valueSize = null ) {
 
     if ( $offset < SHM_CACHE_VALUES_START ||
       $offset + SHM_CACHE_ITEM_META_SIZE + $valueAllocatedSize > SHM_CACHE_VALUES_START + SHM_CACHE_VALUES_SIZE )
@@ -505,10 +538,23 @@ class ShmCache {
       return false;
     }
 
-    $key = substr( $key, 0, self::MAX_KEY_LENGTH );
-    $data = pack( 'A'. self::MAX_KEY_LENGTH, $key ) . pack( 'l', $valueAllocatedSize ) . pack( 'l', $valueSize );
+    $data = '';
+    $writeOffset = $offset;
 
-    if ( shmop_write( $this->block, $data, $offset ) === false ) {
+    if ( $key !== null )
+      $data .= pack( 'A'. self::MAX_KEY_LENGTH, substr( $key, 0, self::MAX_KEY_LENGTH ) );
+    else
+      $writeOffset += self::MAX_KEY_LENGTH;
+
+    if ( $valueAllocatedSize !== null )
+      $data .= pack( 'l', $valueAllocatedSize );
+    else
+      $writeOffset += SHM_CACHE_LONG_SIZE;
+
+    if ( $valueSize !== null )
+      $data .= pack( 'l', $valueSize );
+
+    if ( shmop_write( $this->block, $data, $writeOffset ) === false ) {
       trigger_error( 'Could not write cache item metadata' );
       return false;
     }
@@ -559,7 +605,9 @@ class ShmCache {
       return null;
     }
 
-    $unpacked = unpack( 'A'. self::MAX_KEY_LENGTH .'key/lvalallocsize/lvalsize', $data );
+    static $unpackFormat = 'A'. self::MAX_KEY_LENGTH .'key/lvalallocsize/lvalsize';
+
+    $unpacked = unpack( $unpackFormat, $data );
     $unpacked[ 'offset' ] = $offset;
     // If it's the last item in the values area, the next item's offset is 0,
     // which means "none"
@@ -707,12 +755,15 @@ class ShmCache {
       throw new \Exception( 'Could not create a shared memory block' );
 
     $this->block = $block;
-    $this->initializeMemBlock();
+
+    if ( $isNewBlock )
+      $this->initializeMemBlock();
   }
 
   private function destroyMemBlock() {
 
     shmop_delete( $this->block );
+    shmop_close( $this->block );
     $this->block = null;
   }
 
@@ -796,7 +847,7 @@ $cache = new ShmCache();
 $memcached = new Memcached();
 $memcached->addServer( 'localhost', 11211 );
 
-if ( $argc > 1 && $argv[ 1 ] === 'clear' ) {
+if ( ( @$argc > 1 && $argv[ 1 ] === 'clear' ) || isset( $_REQUEST[ 'clear' ] ) ) {
   if ( $memcached->flush() && $cache->deleteAll() )
     echo 'Deleted all'. PHP_EOL;
   else
