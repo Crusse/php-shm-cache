@@ -463,13 +463,11 @@ class ShmCache {
       $nextItem = $this->getItemMetaByOffset( $nextOffset );
       if ( !$nextItem[ 'free' ] )
         break;
-      echo 'merging '. $nextOffset . PHP_EOL;
       $nextOffset = $nextItem[ 'nextoffset' ];
       $allocSize += SHM_CACHE_ITEM_META_SIZE + $nextItem[ 'valallocsize' ];
     }
 
     if ( $allocSize !== $item[ 'valallocsize' ] ) {
-      echo 'REALLY merging '. $item[ 'offset' ] . PHP_EOL;
       $this->writeItemMeta( $item[ 'offset' ], null, $allocSize );
     }
   }
