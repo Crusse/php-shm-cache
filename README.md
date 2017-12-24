@@ -1,2 +1,2 @@
-Just testing if my naive shared memory -based cache implementation is faster
-than Memcache. The answer is <em>no</em>.
+Just testing if my shared memory -based cache implementation is faster than
+a local memcached. Gets:<em>yes</em>; sets: <em>no</em>.
