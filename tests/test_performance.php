@@ -26,12 +26,12 @@ for ( $i = 0; $i < $itemsToCreate; ++$i ) {
 
   echo 'Set foobar'. $i . PHP_EOL;
   $valuePre = rand();
-  $valuePost = str_repeat( 'x', 100000 );
+  $valuePost = str_repeat( 'x', rand( ceil( Crusse\ShmCache::MAX_VALUE_SIZE / 2 ), Crusse\ShmCache::MAX_VALUE_SIZE - 100 ) );
 
   $start = microtime( true );
   if ( !$cache->set( 'foobar'. $i, $valuePre .' '. $valuePost ) ) {
-    echo 'ERROR: Failed setting ShmCache value foobar'. $i . PHP_EOL;
-    break;
+    $cache->dumpStats();
+    throw new \Exception( 'ERROR: Failed setting ShmCache value foobar'. $i );
   }
   $end = ( microtime( true ) - $start );
   echo 'ShmCache took '. $end .' s'. PHP_EOL;
@@ -39,8 +39,7 @@ for ( $i = 0; $i < $itemsToCreate; ++$i ) {
 
   $start2 = microtime( true );
   if ( !$memcached->set( 'foobar'. $i, $valuePre .' '. $valuePost ) ) {
-    echo 'ERROR: Failed setting Memcached value foobar'. $i . PHP_EOL;
-    break;
+    throw new \Exception( 'ERROR: Failed setting Memcached value foobar'. $i );
   }
   $end2 = ( microtime( true ) - $start2 );
   echo 'Memcached took '. $end2 .' s'. PHP_EOL;
@@ -53,12 +52,13 @@ $start = ( Crusse\ShmCache::MAX_ITEMS >= $itemsToCreate )
 $totalGetTimeShm = 0;
 $totalGetTimeMemcached = 0;
 
-for ( $i = $start; $i < $itemsToCreate; ++$i ) {
+for ( $i = max( $start, $itemsToCreate - 100 ); $i < $itemsToCreate; ++$i ) {
 
   echo 'Get '. $i . PHP_EOL;
 
   $start = microtime( true );
   if ( !$cache->get( 'foobar'. $i ) ) {
+    $cache->dumpStats();
     echo 'ERROR: Failed getting ShmCache value foobar'. $i . PHP_EOL;
     break;
   }

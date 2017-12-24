@@ -451,8 +451,8 @@ class ShmCache {
 
     for ( $i = 0; $metaOffset && $i < SHM_CACHE_KEYS_SLOTS; ++$i ) {
 
-      $testKey = $this->getItemKeyByOffset( $metaOffset );
-      if ( $testKey === $key )
+      $item = $this->getItemMetaByOffset( $metaOffset );
+      if ( !$item[ 'free' ] && $item[ 'key' ] === $key )
         return $index;
 
       $index = ( $index + 1 ) % SHM_CACHE_KEYS_SLOTS;
@@ -689,18 +689,6 @@ class ShmCache {
     $unpacked[ 'free' ] = ( $unpacked[ 'valsize' ] === 0 );
 
     return $unpacked;
-  }
-
-  private function getItemKeyByOffset( $offset ) {
-
-    $data = shmop_read( $this->block, $offset, self::MAX_KEY_LENGTH );
-
-    if ( !$data ) {
-      trigger_error( 'Could not read item metadata at offset '. $offset );
-      return null;
-    }
-
-    return rtrim( $data, ' ' );
   }
 
   private function addItemKey( $key, $itemMetaOffset ) {
