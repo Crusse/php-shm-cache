@@ -169,9 +169,9 @@ class ShmCache {
     $key = $this->sanitizeKey( $key );
 
     if ( $this->getHashTableIndex( $key ) > -1 )
-      return false;
-
-    $ret = $this->_set( $key, $value );
+      $ret = false;
+    else
+      $ret = $this->_set( $key, $value );
 
     $this->releaseLock();
 
@@ -186,9 +186,9 @@ class ShmCache {
     $key = $this->sanitizeKey( $key );
 
     if ( $this->getHashTableIndex( $key ) < 0 )
-      return false;
-
-    $ret = $this->_set( $key, $value );
+      $ret = false;
+    else
+      $ret = $this->_set( $key, $value );
 
     $this->releaseLock();
 
