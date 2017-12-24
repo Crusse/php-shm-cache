@@ -311,6 +311,12 @@ class ShmCache {
         $removedOffset = $removedItem[ 'nextoffset' ];
         // Loop around if we reached the last item in the values memory area
         if ( !$removedOffset ) {
+          // TODO: figure out when this conditional returns true, because
+          // sometimes it does. A bug or intended behavior?
+          if ( $loopedAround ) {
+            $this->dumpStats();
+            throw new \Exception( 'TODO FIXME' );
+          }
           $removedOffset = SHM_CACHE_VALUES_START;
           $loopedAround = true;
         }
