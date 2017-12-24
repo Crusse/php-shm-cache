@@ -442,8 +442,7 @@ class ShmCache {
     }
 
     // Make the value space free by setting the valsize to 0
-    static $valSizeOffset = self::MAX_KEY_LENGTH + SHM_CACHE_LONG_SIZE;
-    if ( shmop_write( $this->block, pack( 'l', 0 ), $itemOffset + $valSizeOffset ) === false ) {
+    if ( shmop_write( $this->block, pack( 'l', 0 ), $itemOffset + self::MAX_KEY_LENGTH + SHM_CACHE_LONG_SIZE ) === false ) {
       trigger_error( 'Could not free the item "'. $key .'" value' );
       return false;
     }
