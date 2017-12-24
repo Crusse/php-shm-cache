@@ -26,7 +26,7 @@ for ( $i = 0; $i < $itemsToCreate; ++$i ) {
 
   echo 'Set foobar'. $i . PHP_EOL;
   $valuePre = rand();
-  $valuePost = str_repeat( 'x', 1000 );
+  $valuePost = str_repeat( 'x', 100000 );
 
   $start = microtime( true );
   if ( !$cache->set( 'foobar'. $i, $valuePre .' '. $valuePost ) ) {
@@ -88,14 +88,14 @@ echo 'Memcached: '. $totalGetTimeMemcached .' s'. PHP_EOL;
 echo '----------------------------------------------'. PHP_EOL . PHP_EOL;
 
 $value = $cache->get( 'foobar'. ( $itemsToCreate - 1 ) );
-echo 'Old value: '. var_export( $value, true ) . PHP_EOL;
+//echo 'Old value: '. var_export( $value, true ) . PHP_EOL;
 $num = ( $value ) ? intval( $value ) : 0;
 
 if ( !$cache->set( 'foobar'. ( $itemsToCreate - 1 ), ( $num + 1 ) .' foo' ) )
   echo 'Failed setting value'. PHP_EOL;
 
 $value = $cache->get( 'foobar'. ( $itemsToCreate - 1 ) );
-echo 'New value: '. var_export( $value, true ) . PHP_EOL;
+//echo 'New value: '. var_export( $value, true ) . PHP_EOL;
 
 //echo '---------------------------------------'. PHP_EOL;
 //echo 'Debug:'. PHP_EOL;

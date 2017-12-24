@@ -55,7 +55,7 @@ class ShmCache {
   // Don't let value allocations become smaller than this, to reduce fragmentation
   const MIN_VALUE_SIZE = 64;
   const MAX_VALUE_SIZE = 1048576; // 1 MB
-  const MAX_ITEMS = 50;
+  const MAX_ITEMS = 500;
   const FULL_CACHE_REMOVED_ITEMS = 10;
   // Use a low load factor (i.e. make there be many more slots in the hash
   // table than the maximum amount of items we'll be storing). 0.5 or less.
