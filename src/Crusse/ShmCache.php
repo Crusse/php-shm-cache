@@ -161,6 +161,23 @@ class ShmCache {
     return $ret;
   }
 
+  function add( $key, $value ) {
+
+    if ( !$this->lock() )
+      return false;
+
+    $key = $this->sanitizeKey( $key );
+
+    if ( $this->getHashTableIndex( $key ) > -1 )
+      return false;
+
+    $ret = $this->_set( $key, $value );
+
+    $this->releaseLock();
+
+    return $ret;
+  }
+
   function replace( $key, $value ) {
 
     if ( !$this->lock() )
