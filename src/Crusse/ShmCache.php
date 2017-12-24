@@ -125,9 +125,114 @@ class ShmCache {
   function set( $key, $value ) {
 
     if ( !$this->lock() )
-      goto error;
+      return false;
 
     $key = $this->sanitizeKey( $key );
+    $ret = $this->_set( $key, $value );
+
+    $this->releaseLock();
+
+    return $ret;
+  }
+
+  function get( $key ) {
+
+    if ( !$this->lock() )
+      return false;
+
+    $key = $this->sanitizeKey( $key );
+    $ret = $this->_get( $key );
+
+    $this->releaseLock();
+
+    return $ret;
+  }
+
+  function exists( $key ) {
+
+    if ( !$this->lock() )
+      return false;
+
+    $key = $this->sanitizeKey( $key );
+    $ret = ( $this->getHashTableIndex( $key ) > -1 );
+
+    $this->releaseLock();
+
+    return $ret;
+  }
+
+  function replace( $key, $value ) {
+
+    if ( !$this->lock() )
+      return false;
+
+    $key = $this->sanitizeKey( $key );
+
+    if ( $this->getHashTableIndex( $key ) < 0 )
+      return false;
+
+    $ret = $this->_set( $key, $value );
+
+    $this->releaseLock();
+
+    return $ret;
+  }
+
+  function delete( $key ) {
+
+    if ( !$this->lock() )
+      return false;
+
+    $key = $this->sanitizeKey( $key );
+    $item = $this->getItemMetaByKey( $key, false );
+
+    if ( !$item ) {
+      $ret = false;
+    }
+    else {
+      $ret = ( $item[ 'free' ] || $this->removeItem( $key, $item[ 'offset' ] ) );
+      $this->mergeItemWithNextFreeValueSlots( $item[ 'offset' ] );
+    }
+
+    $this->releaseLock();
+
+    return $ret;
+  }
+
+  function deleteAll() {
+
+    if ( !$this->lock() )
+      return false;
+
+    try {
+      $this->destroyMemBlock();
+      $this->openMemBlock();
+      $ret = true;
+    }
+    catch ( \Exception $e ) {
+      trigger_error( $e->getMessage() );
+      $ret = false;
+    }
+
+    $this->releaseLock();
+
+    return $ret;
+  }
+
+  private function _get( $key ) {
+
+    $item = $this->getItemMetaByKey( $key, false );
+
+    if ( !$item )
+      $ret = false;
+    else
+      $ret = unserialize( shmop_read( $this->block, $item[ 'offset' ] + SHM_CACHE_ITEM_META_SIZE, $item[ 'valsize' ] ) );
+
+    return $ret;
+  }
+
+  private function _set( $key, $value ) {
+
     $value = serialize( $value );
 
     $existingItem = $this->getItemMetaByKey( $key, false );
@@ -277,88 +382,10 @@ class ShmCache {
         goto error;
     }
 
-    $this->releaseLock();
     return true;
 
-
     error:
-    $this->releaseLock();
     return false;
-  }
-
-  function get( $key ) {
-
-    $key = $this->sanitizeKey( $key );
-
-    if ( !$this->lock() )
-      return false;
-
-    $item = $this->getItemMetaByKey( $key, false );
-
-    if ( !$item )
-      $ret = false;
-    else
-      $ret = unserialize( shmop_read( $this->block, $item[ 'offset' ] + SHM_CACHE_ITEM_META_SIZE, $item[ 'valsize' ] ) );
-
-    $this->releaseLock();
-
-    return $ret;
-  }
-
-  function exists( $key ) {
-
-    $key = $this->sanitizeKey( $key );
-
-    if ( !$this->lock() )
-      return false;
-
-    $ret = ( $this->getHashTableIndex( $key ) > -1 );
-
-    $this->releaseLock();
-
-    return $ret;
-  }
-
-  function delete( $key ) {
-
-    $key = $this->sanitizeKey( $key );
-
-    if ( !$this->lock() )
-      return false;
-
-    $item = $this->getItemMetaByKey( $key, false );
-
-    if ( !$item ) {
-      $ret = false;
-    }
-    else {
-      $ret = ( $item[ 'free' ] || $this->removeItem( $key, $item[ 'offset' ] ) );
-      $this->mergeItemWithNextFreeValueSlots( $item[ 'offset' ] );
-    }
-
-    $this->releaseLock();
-
-    return $ret;
-  }
-
-  function deleteAll() {
-
-    if ( !$this->lock() )
-      return false;
-
-    try {
-      $this->destroyMemBlock();
-      $this->openMemBlock();
-      $ret = true;
-    }
-    catch ( \Exception $e ) {
-      trigger_error( $e->getMessage() );
-      $ret = false;
-    }
-
-    $this->releaseLock();
-
-    return $ret;
   }
 
   private function sanitizeKey( $key ) {
