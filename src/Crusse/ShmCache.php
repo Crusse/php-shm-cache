@@ -297,6 +297,7 @@ class ShmCache {
 
       $itemsToRemove = self::FULL_CACHE_REMOVED_ITEMS;
       $removedOffset = $replacedItem[ 'offset' ];
+      $loopedAround = false;
 
       while ( $itemsToRemove > 0 ) {
         $removedItem = $this->getItemMetaByOffset( $removedOffset );
@@ -309,16 +310,18 @@ class ShmCache {
         }
         $removedOffset = $removedItem[ 'nextoffset' ];
         // Loop around if we reached the last item in the values memory area
-        if ( !$removedOffset )
+        if ( !$removedOffset ) {
           $removedOffset = SHM_CACHE_VALUES_START;
+          $loopedAround = true;
+        }
         // If we reach the offset the we start at, we've seen all the elements
-        if ( $removedOffset === $replacedItem[ 'offset' ] )
+        if ( $loopedAround && $removedOffset >= $replacedItem[ 'offset' ] )
           break;
       }
 
       $this->mergeItemWithNextFreeValueSlots( $replacedItem[ 'offset' ] );
       // Looped around to the start of the values memory area
-      if ( $removedOffset <= $replacedItem[ 'offset' ] )
+      if ( $loopedAround )
         $this->mergeItemWithNextFreeValueSlots( SHM_CACHE_VALUES_START );
     }
 
