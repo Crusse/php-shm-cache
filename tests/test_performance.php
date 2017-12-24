@@ -25,8 +25,8 @@ $totalSetTimeMemcached = 0;
 for ( $i = 0; $i < $itemsToCreate; ++$i ) {
 
   echo 'Set foobar'. $i . PHP_EOL;
-  $valuePre = rand();
-  $valuePost = str_repeat( 'x', rand( ceil( Crusse\ShmCache::MAX_VALUE_SIZE / 2 ), Crusse\ShmCache::MAX_VALUE_SIZE - 100 ) );
+  $valuePre = 'VAL';
+  $valuePost = str_repeat( 'x', Crusse\ShmCache::MAX_VALUE_SIZE - 20 );
 
   $start = microtime( true );
   if ( !$cache->set( 'foobar'. $i, $valuePre .' '. $valuePost ) ) {
@@ -46,13 +46,22 @@ for ( $i = 0; $i < $itemsToCreate; ++$i ) {
   $totalSetTimeMemcached += $end2;
 }
 
-$start = ( Crusse\ShmCache::MAX_ITEMS >= $itemsToCreate )
-  ? 0
-  : $itemsToCreate - Crusse\ShmCache::MAX_ITEMS;
+/*
+// Set a few items again with different sizes to test replacing
+for ( $i = $itemsToCreate - 50; $i < $itemsToCreate; ++$i ) {
+  $valuePre = '123 ';
+  $valuePost = str_repeat( 'x', 1000000 );
+  if ( !$cache->set( 'foobar'. $i, $valuePre .' '. $valuePost ) ) {
+    $cache->dumpStats();
+    throw new \Exception( 'ERROR: Failed setting ShmCache value foobar'. $i );
+  }
+}
+*/
+
 $totalGetTimeShm = 0;
 $totalGetTimeMemcached = 0;
 
-for ( $i = max( $start, $itemsToCreate - 100 ); $i < $itemsToCreate; ++$i ) {
+for ( $i = $itemsToCreate - 100; $i < $itemsToCreate; ++$i ) {
 
   echo 'Get '. $i . PHP_EOL;
 
@@ -89,15 +98,14 @@ echo '----------------------------------------------'. PHP_EOL . PHP_EOL;
 
 $value = $cache->get( 'foobar'. ( $itemsToCreate - 1 ) );
 //echo 'Old value: '. var_export( $value, true ) . PHP_EOL;
-$num = ( $value ) ? intval( $value ) : 0;
 
-if ( !$cache->set( 'foobar'. ( $itemsToCreate - 1 ), ( $num + 1 ) .' foo' ) )
+if ( !$cache->set( 'foobar'. ( $itemsToCreate - 1 ), 'fooooooooooooooo' ) )
   echo 'Failed setting value'. PHP_EOL;
 
 $value = $cache->get( 'foobar'. ( $itemsToCreate - 1 ) );
 //echo 'New value: '. var_export( $value, true ) . PHP_EOL;
 
-//echo '---------------------------------------'. PHP_EOL;
-//echo 'Debug:'. PHP_EOL;
-//$cache->dumpStats();
+echo '---------------------------------------'. PHP_EOL;
+echo 'Debug:'. PHP_EOL;
+$cache->dumpStats();
 
