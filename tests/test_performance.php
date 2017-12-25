@@ -99,13 +99,13 @@ echo '----------------------------------------------'. PHP_EOL . PHP_EOL;
 $value = $cache->get( 'foobar'. ( $itemsToCreate - 1 ) );
 //echo 'Old value: '. var_export( $value, true ) . PHP_EOL;
 
-if ( !$cache->set( 'foobar'. ( $itemsToCreate - 1 ), 'fooooooooooooooo' ) )
+if ( !$cache->set( 'foobar'. ( $itemsToCreate - 1 ), 'foo' ) )
   echo 'Failed setting value'. PHP_EOL;
 
 $value = $cache->get( 'foobar'. ( $itemsToCreate - 1 ) );
 //echo 'New value: '. var_export( $value, true ) . PHP_EOL;
 
-echo '---------------------------------------'. PHP_EOL;
-echo 'Debug:'. PHP_EOL;
-$cache->dumpStats();
+//echo '---------------------------------------'. PHP_EOL;
+//echo 'Debug:'. PHP_EOL;
+//$cache->dumpStats();
 

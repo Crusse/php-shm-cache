@@ -31,7 +31,7 @@ namespace Crusse;
  *     up to MAX_LOAD_FACTOR.
  * 
  * Values area:
- * [[key,valAllocSize,valSize,value],...]
+ * [[key,valAllocSize,valSize,flags,value],...]
  *
  *     'key' is the original key string.
  *
@@ -39,7 +39,7 @@ namespace Crusse;
  *
  *     The ring buffer pointer points to the oldest value slot.
  *
- *     SHM_CACHE_ITEM_META_SIZE = sizeof(key) + sizeof(valAllocSize) + sizeof(valSize)
+ *     SHM_CACHE_ITEM_META_SIZE = sizeof(key) + sizeof(valAllocSize) + sizeof(valSize) + sizeof(flags)
  *
  *     The value slots are always in the order in which they were added to the
  *     cache, so that we can remove the oldest items when the cache gets full.
@@ -62,6 +62,8 @@ class ShmCache {
   const MAX_LOAD_FACTOR = 0.3;
   // If a key string is longer than this, the key is truncated silently
   const MAX_KEY_LENGTH = 250;
+
+  const FLAG_SERIALIZED = 0b00000001;
 
   private $block;
   private $semaphore;
@@ -119,7 +121,8 @@ class ShmCache {
     $keySize = self::MAX_KEY_LENGTH;
     $allocatedSize = SHM_CACHE_LONG_SIZE;
     $valueSize = SHM_CACHE_LONG_SIZE;
-    define( 'SHM_CACHE_ITEM_META_SIZE', $keySize + $allocatedSize + $valueSize );
+    $flagsSize = SHM_CACHE_CHAR_SIZE;
+    define( 'SHM_CACHE_ITEM_META_SIZE', $keySize + $allocatedSize + $valueSize + $flagsSize );
   }
 
   function set( $key, $value ) {
@@ -240,25 +243,28 @@ class ShmCache {
 
     $item = $this->getItemMetaByKey( $key, false );
 
-    if ( !$item )
+    if ( !$item ) {
       $ret = false;
-    else
-      $ret = unserialize( shmop_read( $this->block, $item[ 'offset' ] + SHM_CACHE_ITEM_META_SIZE, $item[ 'valsize' ] ) );
+    }
+    else {
+      $data = shmop_read( $this->block, $item[ 'offset' ] + SHM_CACHE_ITEM_META_SIZE, $item[ 'valsize' ] );
+      $ret = ( $item[ 'flags' ] & self::FLAG_SERIALIZED )
+        ? unserialize( $data )
+        : $data;
+    }
 
     return $ret;
   }
 
   private function _set( $key, $value ) {
 
-    $value = serialize( $value );
-
-    $newValueSize = strlen( $value );
-
-    if ( $newValueSize > self::MAX_VALUE_SIZE ) {
-      trigger_error( 'Given cache item "'. $key .'" is too large to be stored into the cache' );
-      goto error;
+    $valueIsSerialized = false;
+    if ( !is_string( $value ) ) {
+      $value = serialize( $value );
+      $valueIsSerialized = true;
     }
 
+    $newValueSize = strlen( $value );
     $existingItem = $this->getItemMetaByKey( $key, false );
 
     if ( $existingItem ) {
@@ -277,6 +283,15 @@ class ShmCache {
         $this->mergeItemWithNextFreeValueSlots( $existingItem[ 'offset' ] );
         $existingItem = null;
       }
+    }
+
+    if ( $newValueSize > self::MAX_VALUE_SIZE ) {
+      // Remove the item that was about to be overwritten. This emulates
+      // memcached: https://github.com/memcached/memcached/wiki/Performance#how-it-handles-set-failures
+      if ( $existingItem )
+        $this->removeItem( $key, $existingItem[ 'offset' ] );
+      trigger_error( 'Given cache item "'. $key .'" is too large to be stored into the cache' );
+      goto error;
     }
 
     if ( !$existingItem ) {
@@ -395,7 +410,7 @@ class ShmCache {
       $splitSlotOffset = $replacedItemOffset + SHM_CACHE_ITEM_META_SIZE + $newValueSize;
       $splitItemValAllocSize = $splitSlotSize - SHM_CACHE_ITEM_META_SIZE;
 
-      if ( !$this->writeItemMeta( $splitSlotOffset, '', $splitItemValAllocSize, 0 ) )
+      if ( !$this->writeItemMeta( $splitSlotOffset, '', $splitItemValAllocSize, 0, 0 ) )
         goto error;
 
       $allocatedSize -= $splitSlotSize;
@@ -403,7 +418,11 @@ class ShmCache {
       $this->mergeItemWithNextFreeValueSlots( $splitSlotOffset );
     }
 
-    if ( !$this->writeItemMeta( $replacedItemOffset, $key, $allocatedSize, $newValueSize ) )
+    $flags = 0;
+    if ( $valueIsSerialized )
+      $flags |= self::FLAG_SERIALIZED;
+
+    if ( !$this->writeItemMeta( $replacedItemOffset, $key, $allocatedSize, $newValueSize, $flags ) )
       goto error;
     if ( !$this->writeItemValue( $replacedItemOffset + SHM_CACHE_ITEM_META_SIZE, $value ) )
       goto error;
@@ -558,7 +577,8 @@ class ShmCache {
     }
 
     if ( $allocSize !== $item[ 'valallocsize' ] ) {
-      $this->writeItemMeta( $item[ 'offset' ], null, $allocSize );
+      // Resize
+      $this->writeItemMeta( $itemOffset, null, $allocSize );
       // Fix the ring buffer pointer
       $bufferPtr = $this->getRingBufferPointer();
       if ( $bufferPtr > $itemOffset && $bufferPtr < $itemOffset + $allocSize )
@@ -623,7 +643,7 @@ class ShmCache {
     return true;
   }
 
-  private function writeItemMeta( $offset, $key = null, $valueAllocatedSize = null, $valueSize = null ) {
+  private function writeItemMeta( $offset, $key = null, $valueAllocatedSize = null, $valueSize = null, $flags = null ) {
 
     $data = '';
     $writeOffset = $offset;
@@ -633,17 +653,33 @@ class ShmCache {
     else
       $writeOffset += self::MAX_KEY_LENGTH;
 
-    if ( $valueAllocatedSize !== null ) {
+    if ( $valueAllocatedSize !== null )
       $data .= pack( 'l', $valueAllocatedSize );
-    }
-    else {
-      if ( $key !== null && $valueSize !== null )
-        throw new \InvalidArgumentException( 'If $key and $valueSize are set, $valueAllocatedSize must also be set' );
+    else
       $writeOffset += SHM_CACHE_LONG_SIZE;
-    }
 
     if ( $valueSize !== null )
       $data .= pack( 'l', $valueSize );
+    else
+      $writeOffset += SHM_CACHE_LONG_SIZE;
+
+    if ( $flags !== null )
+      $data .= pack( 'c', $flags );
+
+    if ( $key !== null ) {
+      if ( $valueAllocatedSize !== null ) {
+        if ( $valueSize === null && $flags !== null )
+          throw new \InvalidArgumentException( 'If $valueAllocatedSize and $flags are set, $valueSize must also be set' );
+      }
+      else {
+        if ( $valueSize !== null || $flags !== null )
+          throw new \InvalidArgumentException( 'If $key and ($valueSize or $flags) are set, $valueAllocatedSize must also be set' );
+      }
+    }
+    else if ( $valueAllocatedSize !== null ) {
+      if ( $valueSize === null && $flags !== null )
+        throw new \InvalidArgumentException( 'If $valueAllocatedSize and $flags are set, $valueSize must also be set' );
+    }
 
     if ( shmop_write( $this->block, $data, $writeOffset ) === false ) {
       trigger_error( 'Could not write cache item metadata' );
@@ -684,7 +720,7 @@ class ShmCache {
 
   private function getItemMetaByOffset( $offset, $withKey = true ) {
 
-    $unpackFormat = 'lvalallocsize/lvalsize';
+    $unpackFormat = 'lvalallocsize/lvalsize/cflags';
     $readOffset = $offset;
 
     if ( $withKey )
@@ -889,7 +925,7 @@ class ShmCache {
     $this->setItemCount( 0 );
 
     // Initialize first cache item
-    if ( !$this->writeItemMeta( SHM_CACHE_VALUES_START, '', SHM_CACHE_VALUES_SIZE - SHM_CACHE_ITEM_META_SIZE, 0 ) )
+    if ( !$this->writeItemMeta( SHM_CACHE_VALUES_START, '', SHM_CACHE_VALUES_SIZE - SHM_CACHE_ITEM_META_SIZE, 0, 0 ) )
       trigger_error( 'Could not create initial cache item' );
   }
 
