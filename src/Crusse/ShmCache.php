@@ -645,6 +645,20 @@ class ShmCache {
 
   private function writeItemMeta( $offset, $key = null, $valueAllocatedSize = null, $valueSize = null, $flags = null ) {
 
+    if ( $key !== null ) {
+      if ( $valueAllocatedSize !== null ) {
+        if ( $valueSize === null && $flags !== null )
+          throw new \InvalidArgumentException( 'If $valueAllocatedSize and $flags are set, $valueSize must also be set' );
+      }
+      else if ( $valueSize !== null || $flags !== null ) {
+        throw new \InvalidArgumentException( 'If $key and ($valueSize or $flags) are set, $valueAllocatedSize must also be set' );
+      }
+    }
+    else if ( $valueAllocatedSize !== null ) {
+      if ( $valueSize === null && $flags !== null )
+        throw new \InvalidArgumentException( 'If $valueAllocatedSize and $flags are set, $valueSize must also be set' );
+    }
+
     $data = '';
     $writeOffset = $offset;
 
@@ -655,31 +669,16 @@ class ShmCache {
 
     if ( $valueAllocatedSize !== null )
       $data .= pack( 'l', $valueAllocatedSize );
-    else
+    else if ( $key === null )
       $writeOffset += SHM_CACHE_LONG_SIZE;
 
     if ( $valueSize !== null )
       $data .= pack( 'l', $valueSize );
-    else
+    else if ( $key === null && $valueAllocatedSize === null )
       $writeOffset += SHM_CACHE_LONG_SIZE;
 
     if ( $flags !== null )
       $data .= pack( 'c', $flags );
-
-    if ( $key !== null ) {
-      if ( $valueAllocatedSize !== null ) {
-        if ( $valueSize === null && $flags !== null )
-          throw new \InvalidArgumentException( 'If $valueAllocatedSize and $flags are set, $valueSize must also be set' );
-      }
-      else {
-        if ( $valueSize !== null || $flags !== null )
-          throw new \InvalidArgumentException( 'If $key and ($valueSize or $flags) are set, $valueAllocatedSize must also be set' );
-      }
-    }
-    else if ( $valueAllocatedSize !== null ) {
-      if ( $valueSize === null && $flags !== null )
-        throw new \InvalidArgumentException( 'If $valueAllocatedSize and $flags are set, $valueSize must also be set' );
-    }
 
     if ( shmop_write( $this->block, $data, $writeOffset ) === false ) {
       trigger_error( 'Could not write cache item metadata' );
