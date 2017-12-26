@@ -10,7 +10,7 @@ namespace Crusse;
  * 
  * - FIFO queue: oldest element is evicted first when the cache is full
  * - Uses a hash table (with linear probing) for accessing items quickly
- * - Stores the hash table and items' values in UNIX shared memory
+ * - Stores the hash table and items' values in Unix shared memory
  * 
  * FIFO queue area:
  * [itemcount][ringbufferpointer]
@@ -43,6 +43,9 @@ namespace Crusse;
  *
  *     The value slots are always in the order in which they were added to the
  *     cache, so that we can remove the oldest items when the cache gets full.
+ *
+ * You can use the Unix programs `ipcs` and `ipcrm` to list and remove the
+ * memory block and semaphore created by this class, if something goes wrong.
  *
  */
 class ShmCache {
