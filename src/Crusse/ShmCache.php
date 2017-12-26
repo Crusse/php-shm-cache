@@ -831,18 +831,6 @@ class ShmCache {
 
   private function writeItemKey( $hashTableIndex, $itemMetaOffset ) {
 
-    if ( $hashTableIndex < 0 || $hashTableIndex >= SHM_CACHE_KEYS_SLOTS ) {
-      trigger_error( 'Invalid hash table offset "'. $hashTableIndex .'"' );
-      return false;
-    }
-
-    if ( $itemMetaOffset && ( $itemMetaOffset < SHM_CACHE_VALUES_START ||
-      $itemMetaOffset >= SHM_CACHE_VALUES_START + SHM_CACHE_VALUES_SIZE ) )
-    {
-      trigger_error( 'Invalid item offset "'. $itemMetaOffset .'"' );
-      return false;
-    }
-
     $hashTableOffset = SHM_CACHE_KEYS_START + $hashTableIndex * SHM_CACHE_LONG_SIZE;
 
     if ( shmop_write( $this->block, pack( 'l', $itemMetaOffset ), $hashTableOffset ) === false ) {
