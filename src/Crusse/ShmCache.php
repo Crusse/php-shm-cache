@@ -19,9 +19,9 @@ namespace Crusse;
  *     keep the hash table load factor below MAX_LOAD_FACTOR.
  *
  *     The ring buffer pointer points to the oldest cache item's value slot.
- *     When the cache is full (MAX_ITEMS or MEM_BLOCK_SIZE has been reached),
- *     the oldest items are removed one by one when adding a new item, until
- *     there is enough space for the new item.
+ *     When the cache is full (SHM_CACHE_MAX_ITEMS or MEM_BLOCK_SIZE has been
+ *     reached), the oldest items are removed one by one when adding a new
+ *     item, until there is enough space for the new item.
  * 
  * Keys area:
  * [itemmetaoffset,itemmetaoffset,...]
@@ -56,13 +56,12 @@ class ShmCache {
   const MEM_BLOCK_SIZE = 130000000;
   const SAFE_AREA_SIZE = 64;
   // Don't let value allocations become smaller than this, to reduce fragmentation
-  const MIN_VALUE_SIZE = 64;
+  const MIN_VALUE_ALLOC_SIZE = 128;
   const MAX_VALUE_SIZE = 1048576; // 1 MB
-  const MAX_ITEMS = 500;
   const FULL_CACHE_REMOVED_ITEMS = 10;
   // Use a low load factor (i.e. make there be many more slots in the hash
   // table than the maximum amount of items we'll be storing). 0.5 or less.
-  const MAX_LOAD_FACTOR = 0.35;
+  const MAX_LOAD_FACTOR = 0.5;
   // If a key string is longer than this, the key is truncated silently
   const MAX_KEY_LENGTH = 250;
 
@@ -95,39 +94,73 @@ class ShmCache {
       $this->releaseLock();
   }
 
+  /**
+   * We define these constants here, as PHP<5.6 doesn't accept arithmetic
+   * expressions in class constants.
+   */
   static private function createDefines() {
 
     if ( defined( 'SHM_CACHE_LONG_SIZE' ) )
       return;
 
-    // We define these constants here, as PHP<5.6 doesn't accept arithmetic
-    // expressions in class constants
+    $primes = [
+      5003,
+      10007,
+      20011,
+      30011,
+      40009,
+      50021,
+      75013,
+      100012,
+      125017,
+      150011,
+      200009,
+      250013,
+      300017,
+    ];
 
     define( 'SHM_CACHE_LONG_SIZE', strlen( pack( 'l', 1 ) ) ); // i.e. sizeof(long) in C
     define( 'SHM_CACHE_CHAR_SIZE', strlen( pack( 'c', 1 ) ) ); // i.e. sizeof(char) in C
 
+    $keySize = self::MAX_KEY_LENGTH;
+    $allocatedSize = SHM_CACHE_LONG_SIZE;
+    $valueSize = SHM_CACHE_LONG_SIZE;
+    $flagsSize = SHM_CACHE_CHAR_SIZE;
+    define( 'SHM_CACHE_ITEM_META_SIZE', $keySize + $allocatedSize + $valueSize + $flagsSize );
+
     // FIFO area
+
     $itemCountSize = SHM_CACHE_LONG_SIZE;
     $ringBufferPtrSize = SHM_CACHE_LONG_SIZE;
     define( 'SHM_CACHE_FIFO_AREA_START', 0 );
     define( 'SHM_CACHE_FIFO_AREA_SIZE', $itemCountSize + $ringBufferPtrSize );
 
     // Keys area (i.e. cache item hash table)
-    define( 'SHM_CACHE_KEYS_SLOTS', ceil( self::MAX_ITEMS / self::MAX_LOAD_FACTOR ) );
+
+    $approxValuesAreaSize = self::MEM_BLOCK_SIZE - 100000 * SHM_CACHE_LONG_SIZE;
+    $approxBytesPerValuesAreaItem = SHM_CACHE_ITEM_META_SIZE + self::MIN_VALUE_ALLOC_SIZE * 2;
+
+    define( 'SHM_CACHE_MAX_ITEMS', floor( $approxValuesAreaSize / $approxBytesPerValuesAreaItem ) );
+    $hashTableSlotCount = ceil( SHM_CACHE_MAX_ITEMS / self::MAX_LOAD_FACTOR );
+
+    foreach ( $primes as $prime ) {
+      if ( $prime >= $hashTableSlotCount ) {
+        $hashTableSlotCount = $prime;
+        break;
+      }
+    }
+
+    define( 'SHM_CACHE_KEYS_SLOTS', $hashTableSlotCount );
     define( 'SHM_CACHE_KEYS_START', SHM_CACHE_FIFO_AREA_START + SHM_CACHE_FIFO_AREA_SIZE + self::SAFE_AREA_SIZE );
     // The hash table values are "pointers", i.e. offsets to the values area
     define( 'SHM_CACHE_KEYS_SIZE', SHM_CACHE_KEYS_SLOTS * SHM_CACHE_LONG_SIZE );
 
     // Values area
+
     define( 'SHM_CACHE_VALUES_START', SHM_CACHE_KEYS_START + SHM_CACHE_KEYS_SIZE + self::SAFE_AREA_SIZE );
     define( 'SHM_CACHE_VALUES_SIZE', self::MEM_BLOCK_SIZE - SHM_CACHE_VALUES_START );
-    $keySize = self::MAX_KEY_LENGTH;
-    $allocatedSize = SHM_CACHE_LONG_SIZE;
-    $valueSize = SHM_CACHE_LONG_SIZE;
-    $flagsSize = SHM_CACHE_CHAR_SIZE;
-    define( 'SHM_CACHE_ITEM_META_SIZE', $keySize + $allocatedSize + $valueSize + $flagsSize );
     define( 'SHM_CACHE_LAST_ITEM_MAX_OFFSET', SHM_CACHE_VALUES_START + SHM_CACHE_VALUES_SIZE -
-      SHM_CACHE_ITEM_META_SIZE - self::MIN_VALUE_SIZE );
+      SHM_CACHE_ITEM_META_SIZE - self::MIN_VALUE_ALLOC_SIZE );
   }
 
   function set( $key, $value ) {
@@ -221,14 +254,10 @@ class ShmCache {
         $item = $this->getItemMetaByOffset( $metaOffset, false );
 
         if ( $item ) {
-          if ( !$item[ 'valsize' ] ) {
+          if ( !$item[ 'valsize' ] )
             $ret = true;
-          }
-          else {
+          else
             $ret = $this->removeItem( $key, $metaOffset );
-            if ( $ret )
-              $this->mergeItemWithNextFreeValueSlots( $metaOffset );
-          }
         }
       }
     }
@@ -300,70 +329,71 @@ class ShmCache {
     }
 
     $newValueSize = strlen( $value );
-    $existingItem = null;
-    $replacedItem = null;
-    $replacedItemOffset = 0;
     $index = $this->getHashTableIndex( $key );
 
     if ( $index >= 0 ) {
+
       $metaOffset = $this->getItemMetaOffsetByHashTableIndex( $index );
-      if ( $metaOffset > 0 )
+
+      if ( $metaOffset > 0 ) {
+
         $existingItem = $this->getItemMetaByOffset( $metaOffset, false );
+
+        if ( $existingItem ) {
+          // There's enough space for the new value in the existing item's value
+          // memory area spot. Replace the value in-place.
+          if ( $newValueSize <= $existingItem[ 'valallocsize' ] ) {
+            $flags = 0;
+            if ( $valueIsSerialized )
+              $flags |= self::FLAG_SERIALIZED;
+            if ( !$this->writeItemMeta( $metaOffset, null, null, $newValueSize, $flags ) )
+              goto error;
+            if ( !$this->writeItemValue( $metaOffset + SHM_CACHE_ITEM_META_SIZE, $value ) )
+              goto error;
+            return true;
+          }
+          // The new value is too large to fit into the existing item's spot, and
+          // would overwrite 1 or more items to the right of it. We'll instead
+          // remove the existing item, and handle this as a new value, so that this
+          // item will replace 1 or more of the _oldest_ items (that are pointed to
+          // by the ring buffer pointer).
+          else {
+            if ( !$this->removeItem( $key, $metaOffset ) )
+              goto error;
+          }
+        }
+      }
     }
 
-    if ( $existingItem ) {
-      // There's enough space for the new value in the existing item's value
-      // memory area spot
-      if ( $newValueSize <= $existingItem[ 'valallocsize' ] ) {
-        $replacedItem = $existingItem;
-        $replacedItemOffset = $metaOffset;
-      }
-      // The new value is too large to fit into the existing item's spot, and
-      // would overwrite 1 or more items to the right of it. We'll instead
-      // remove the existing item, and handle this as a new value, so that this
-      // item will replace 1 or more of the _oldest_ items (that are pointed to
-      // by the ring buffer pointer).
-      else {
-        if ( !$this->removeItem( $key, $metaOffset ) )
-          goto error;
-        $this->mergeItemWithNextFreeValueSlots( $metaOffset );
-        $existingItem = null;
-      }
-    }
-
+    // Note: whenever we cannot store the value to the cache, we remove any
+    // existing item with the same key. This emulates memcached:
+    // https://github.com/memcached/memcached/wiki/Performance#how-it-handles-set-failures
     if ( $newValueSize > self::MAX_VALUE_SIZE ) {
-      // Remove the item that was about to be overwritten. This emulates
-      // memcached: https://github.com/memcached/memcached/wiki/Performance#how-it-handles-set-failures
-      if ( $existingItem )
-        $this->removeItem( $key, $metaOffset );
       trigger_error( 'Given cache item "'. rawurlencode( $key ) .'" is too large to be stored into the cache' );
       goto error;
     }
 
-    if ( !$existingItem ) {
-      $oldestItemOffset = $this->getRingBufferPointer();
-      if ( $oldestItemOffset <= 0 )
+    $oldestItemOffset = $this->getRingBufferPointer();
+    if ( $oldestItemOffset <= 0 )
+      goto error;
+    $replacedItem = $this->getItemMetaByOffset( $oldestItemOffset );
+    if ( !$replacedItem )
+      goto error;
+    $replacedItemOffset = $oldestItemOffset;
+    $replacedItemIsFree = !$replacedItem[ 'valsize' ];
+    if ( !$replacedItemIsFree ) {
+      if ( !$this->removeItem( $replacedItem[ 'key' ], $replacedItemOffset ) )
         goto error;
-      $replacedItem = $this->getItemMetaByOffset( $oldestItemOffset );
-      if ( !$replacedItem )
-        goto error;
-      $replacedItemOffset = $oldestItemOffset;
-      if ( $replacedItem[ 'valsize' ] ) {
-        if ( !$this->removeItem( $replacedItem[ 'key' ], $replacedItemOffset ) )
-          goto error;
-      }
     }
 
-    $replacedItemIsFree = !$replacedItem[ 'valsize' ];
     $allocatedSize = $replacedItem[ 'valallocsize' ];
-    $nextItemOffset = $this->getNextItemOffset( $replacedItemOffset, $allocatedSize );
 
     // When the maximum amount of cached items is reached, and we're adding
     // a new item (rather than just writing into an existing item's memory
     // space) we start removing the oldest items. We don't remove just one,
     // but multiple at once, so that any calls to set() afterwards will not
     // immediately have to remove an item again.
-    if ( !$existingItem && $this->getItemCount() >= self::MAX_ITEMS ) {
+    if ( $this->getItemCount() >= SHM_CACHE_MAX_ITEMS ) {
 
       $itemsToRemove = self::FULL_CACHE_REMOVED_ITEMS;
 
@@ -372,7 +402,8 @@ class ShmCache {
       if ( !$replacedItemIsFree )
         --$itemsToRemove;
 
-      $removedOffset = $this->getNextItemOffset( $replacedItemOffset, $replacedItem[ 'valallocsize' ] );
+      $allocatedSize = $this->mergeItemWithNextFreeValueSlots( $replacedItemOffset );
+      $removedOffset = $this->getNextItemOffset( $replacedItemOffset, $allocatedSize );
       $loopedAround = false;
 
       while ( $itemsToRemove > 0 ) {
@@ -395,21 +426,23 @@ class ShmCache {
         $removedItem = $this->getItemMetaByOffset( $removedOffset );
         if ( !$removedItem )
           goto error;
+
+        if ( $loopedAround && $removedOffset === SHM_CACHE_VALUES_START )
+          $removedAllocSize = $this->mergeItemWithNextFreeValueSlots( $removedOffset );
+        else
+          $removedAllocSize = $removedItem[ 'valallocsize' ];
+
         if ( $removedItem[ 'valsize' ] ) {
-          if ( !$this->removeItem( $removedItem[ 'key' ], $removedOffset ) ) {
+          if ( !$this->removeItem( $removedItem[ 'key' ], $removedOffset ) )
             goto error;
-          }
           --$itemsToRemove;
         }
 
-        $removedOffset = $this->getNextItemOffset( $removedOffset, $removedItem[ 'valallocsize' ] );
+        $removedOffset = $this->getNextItemOffset( $removedOffset, $removedAllocSize );
       }
-
-      $allocatedSize = $this->mergeItemWithNextFreeValueSlots( $replacedItemOffset );
-      // Looped around to the start of the values memory area
-      if ( $loopedAround )
-        $this->mergeItemWithNextFreeValueSlots( SHM_CACHE_VALUES_START );
     }
+
+    $nextItemOffset = $this->getNextItemOffset( $replacedItemOffset, $allocatedSize );
 
     // The new value doesn't fit into an existing cache item. Make space for the
     // new value by merging next oldest cache items one by one into the current
@@ -425,7 +458,6 @@ class ShmCache {
           if ( !$this->removeItem( $key, $replacedItemOffset ) )
             goto error;
         }
-        $this->mergeItemWithNextFreeValueSlots( $replacedItemOffset );
 
         // Free the first item
         $firstItem = $this->getItemMetaByOffset( SHM_CACHE_VALUES_START );
@@ -461,7 +493,7 @@ class ShmCache {
     $splitSlotSize = $allocatedSize - $newValueSize;
 
     // Split the cache item into two, if there is enough space left over
-    if ( $splitSlotSize >= SHM_CACHE_ITEM_META_SIZE + self::MIN_VALUE_SIZE ) {
+    if ( $splitSlotSize >= SHM_CACHE_ITEM_META_SIZE + self::MIN_VALUE_ALLOC_SIZE ) {
 
       $splitSlotOffset = $replacedItemOffset + SHM_CACHE_ITEM_META_SIZE + $newValueSize;
       $splitItemValAllocSize = $splitSlotSize - SHM_CACHE_ITEM_META_SIZE;
@@ -471,7 +503,6 @@ class ShmCache {
 
       $allocatedSize -= $splitSlotSize;
       $nextItemOffset = $splitSlotOffset;
-      $this->mergeItemWithNextFreeValueSlots( $splitSlotOffset );
     }
 
     $flags = 0;
@@ -483,27 +514,17 @@ class ShmCache {
     if ( !$this->writeItemValue( $replacedItemOffset + SHM_CACHE_ITEM_META_SIZE, $value ) )
       goto error;
 
-    // Overwrite an existing item. No need to adjust buffer pointer or item
-    // count.
-    if ( $existingItem ) {
+    if ( !$this->addItemKey( $key, $replacedItemOffset ) )
+      goto error;
 
-      if ( !$this->updateItemKey( $key, $replacedItemOffset ) )
-        goto error;
-    }
-    else {
+    $this->setItemCount( $this->getItemCount() + 1 );
 
-      if ( !$this->addItemKey( $key, $replacedItemOffset ) )
-        goto error;
+    $newBufferPtr = ( $nextItemOffset )
+      ? $nextItemOffset
+      : SHM_CACHE_VALUES_START;
 
-      $this->setItemCount( $this->getItemCount() + 1 );
-
-      $newBufferPtr = ( $nextItemOffset )
-        ? $nextItemOffset
-        : SHM_CACHE_VALUES_START;
-
-      if ( !$this->setRingBufferPointer( $newBufferPtr ) )
-        goto error;
-    }
+    if ( !$this->setRingBufferPointer( $newBufferPtr ) )
+      goto error;
 
     return true;
 
@@ -784,9 +805,9 @@ class ShmCache {
 
   private function getNextItemOffset( $itemOffset, $itemValAllocSize ) {
 
+    $nextItemOffset = $itemOffset + SHM_CACHE_ITEM_META_SIZE + $itemValAllocSize;
     // If it's the last item in the values area, the next item's offset is 0,
     // which means "none"
-    $nextItemOffset = $itemOffset + SHM_CACHE_ITEM_META_SIZE + $itemValAllocSize;
     if ( $nextItemOffset > SHM_CACHE_LAST_ITEM_MAX_OFFSET )
       $nextItemOffset = 0;
 
@@ -925,6 +946,8 @@ class ShmCache {
 
   private function destroyMemBlock() {
 
+    // TODO FIXME: this won't work when the current process's owner isn't the
+    // user that created the block, even if the block's permissions are 0777
     shmop_delete( $this->block );
     shmop_close( $this->block );
     $this->block = null;
@@ -961,8 +984,6 @@ class ShmCache {
 
   function dumpStats() {
 
-    echo 'Available space for values: '. floor( SHM_CACHE_VALUES_SIZE / 1024 / 1024 ) .' MB'. PHP_EOL;
-    echo 'Ring buffer pointer: '. $this->getRingBufferPointer() . PHP_EOL;
     echo 'Hash table clusters:'. PHP_EOL;
 
     for ( $i = SHM_CACHE_KEYS_START; $i < SHM_CACHE_KEYS_START + SHM_CACHE_KEYS_SIZE; $i += SHM_CACHE_LONG_SIZE ) {
@@ -1002,7 +1023,10 @@ class ShmCache {
     }
 
     echo PHP_EOL;
+    echo 'Hash table: '. SHM_CACHE_KEYS_SLOTS .' slots, '. round( SHM_CACHE_KEYS_SIZE / 1000000, 3 ) .' MB' . PHP_EOL;
     echo 'Non-free items: '. $nonFreeItems . PHP_EOL;
+    echo 'Available space for values: '. floor( SHM_CACHE_VALUES_SIZE / 1024 / 1024 ) .' MB'. PHP_EOL;
+    echo 'Ring buffer pointer: '. $this->getRingBufferPointer() . PHP_EOL;
     echo PHP_EOL;
   }
 }
