@@ -13,7 +13,7 @@ namespace Crusse;
  * - Stores the hash table and items' values in UNIX shared memory
  * 
  * FIFO queue area:
- * [itemCount][ringBufferPointer]
+ * [itemcount][ringbufferpointer]
  *
  *     The item count is the amount of currently stored items. It's used to
  *     keep the hash table load factor below MAX_LOAD_FACTOR.
@@ -24,22 +24,22 @@ namespace Crusse;
  *     there is enough space for the new item.
  * 
  * Keys area:
- * [itemMetaOffset,itemMetaOffset,...]
+ * [itemmetaoffset,itemmetaoffset,...]
  *
  *     The keys area is a hash table of SHM_CACHE_KEYS_SLOTS items. Our hash
  *     table implementation uses linear probing, so this table is ever filled
  *     up to MAX_LOAD_FACTOR.
  * 
  * Values area:
- * [[key,valAllocSize,valSize,flags,value],...]
+ * [[key,valallocsize,valsize,flags,value],...]
  *
  *     'key' is the original key string.
  *
- *     If 'valSize' is 0, that value slot is free.
+ *     If 'valsize' is 0, that value slot is free.
  *
  *     The ring buffer pointer points to the oldest value slot.
  *
- *     SHM_CACHE_ITEM_META_SIZE = sizeof(key) + sizeof(valAllocSize) + sizeof(valSize) + sizeof(flags)
+ *     SHM_CACHE_ITEM_META_SIZE = sizeof(key) + sizeof(valallocsize) + sizeof(valsize) + sizeof(flags)
  *
  *     The value slots are always in the order in which they were added to the
  *     cache, so that we can remove the oldest items when the cache gets full.
@@ -59,7 +59,7 @@ class ShmCache {
   const FULL_CACHE_REMOVED_ITEMS = 10;
   // Use a low load factor (i.e. make there be many more slots in the hash
   // table than the maximum amount of items we'll be storing). 0.5 or less.
-  const MAX_LOAD_FACTOR = 0.3;
+  const MAX_LOAD_FACTOR = 0.35;
   // If a key string is longer than this, the key is truncated silently
   const MAX_KEY_LENGTH = 250;
 
@@ -123,6 +123,8 @@ class ShmCache {
     $valueSize = SHM_CACHE_LONG_SIZE;
     $flagsSize = SHM_CACHE_CHAR_SIZE;
     define( 'SHM_CACHE_ITEM_META_SIZE', $keySize + $allocatedSize + $valueSize + $flagsSize );
+    define( 'SHM_CACHE_LAST_ITEM_MAX_OFFSET', SHM_CACHE_VALUES_START + SHM_CACHE_VALUES_SIZE -
+      SHM_CACHE_ITEM_META_SIZE - self::MIN_VALUE_SIZE );
   }
 
   function set( $key, $value ) {
@@ -204,14 +206,28 @@ class ShmCache {
       return false;
 
     $key = $this->sanitizeKey( $key );
-    $item = $this->getItemMetaByKey( $key, false );
+    $index = $this->getHashTableIndex( $key );
+    $ret = false;
 
-    if ( !$item ) {
-      $ret = false;
-    }
-    else {
-      $ret = ( $item[ 'free' ] || $this->removeItem( $key, $item[ 'offset' ] ) );
-      $this->mergeItemWithNextFreeValueSlots( $item[ 'offset' ] );
+    if ( $index >= 0 ) {
+
+      $metaOffset = $this->getItemMetaOffsetByHashTableIndex( $index );
+
+      if ( $metaOffset > 0 ) {
+
+        $item = $this->getItemMetaByOffset( $metaOffset, false );
+
+        if ( $item ) {
+          if ( !$item[ 'valsize' ] ) {
+            $ret = true;
+          }
+          else {
+            $ret = $this->removeItem( $key, $metaOffset );
+            if ( $ret )
+              $this->mergeItemWithNextFreeValueSlots( $metaOffset );
+          }
+        }
+      }
     }
 
     $this->releaseLock();
@@ -241,16 +257,32 @@ class ShmCache {
 
   private function _get( $key ) {
 
-    $item = $this->getItemMetaByKey( $key, false );
+    $index = $this->getHashTableIndex( $key );
+    $ret = false;
 
-    if ( !$item ) {
-      $ret = false;
-    }
-    else {
-      $data = shmop_read( $this->block, $item[ 'offset' ] + SHM_CACHE_ITEM_META_SIZE, $item[ 'valsize' ] );
-      $ret = ( $item[ 'flags' ] & self::FLAG_SERIALIZED )
-        ? unserialize( $data )
-        : $data;
+    if ( $index >= 0 ) {
+
+      $metaOffset = $this->getItemMetaOffsetByHashTableIndex( $index );
+
+      if ( $metaOffset > 0 ) {
+
+        $item = $this->getItemMetaByOffset( $metaOffset, false );
+
+        if ( $item ) {
+
+          $data = shmop_read( $this->block, $metaOffset + SHM_CACHE_ITEM_META_SIZE, $item[ 'valsize' ] );
+
+          if ( $data === false ) {
+            trigger_error( 'Could not read value for item "'. rawurlencode( $key ) .'"' );
+            $ret = false;
+          }
+          else {
+            $ret = ( $item[ 'flags' ] & self::FLAG_SERIALIZED )
+              ? unserialize( $data )
+              : $data;
+          }
+        }
+      }
     }
 
     return $ret;
@@ -265,13 +297,23 @@ class ShmCache {
     }
 
     $newValueSize = strlen( $value );
-    $existingItem = $this->getItemMetaByKey( $key, false );
+    $existingItem = null;
+    $replacedItem = null;
+    $replacedItemOffset = 0;
+    $index = $this->getHashTableIndex( $key );
+
+    if ( $index >= 0 ) {
+      $metaOffset = $this->getItemMetaOffsetByHashTableIndex( $index );
+      if ( $metaOffset > 0 )
+        $existingItem = $this->getItemMetaByOffset( $metaOffset, false );
+    }
 
     if ( $existingItem ) {
       // There's enough space for the new value in the existing item's value
       // memory area spot
       if ( $newValueSize <= $existingItem[ 'valallocsize' ] ) {
         $replacedItem = $existingItem;
+        $replacedItemOffset = $metaOffset;
       }
       // The new value is too large to fit into the existing item's spot, and
       // would overwrite 1 or more items to the right of it. We'll instead
@@ -279,8 +321,9 @@ class ShmCache {
       // item will replace 1 or more of the _oldest_ items (that are pointed to
       // by the ring buffer pointer).
       else {
-        $this->removeItem( $key, $existingItem[ 'offset' ] );
-        $this->mergeItemWithNextFreeValueSlots( $existingItem[ 'offset' ] );
+        if ( !$this->removeItem( $key, $metaOffset ) )
+          goto error;
+        $this->mergeItemWithNextFreeValueSlots( $metaOffset );
         $existingItem = null;
       }
     }
@@ -289,8 +332,8 @@ class ShmCache {
       // Remove the item that was about to be overwritten. This emulates
       // memcached: https://github.com/memcached/memcached/wiki/Performance#how-it-handles-set-failures
       if ( $existingItem )
-        $this->removeItem( $key, $existingItem[ 'offset' ] );
-      trigger_error( 'Given cache item "'. $key .'" is too large to be stored into the cache' );
+        $this->removeItem( $key, $metaOffset );
+      trigger_error( 'Given cache item "'. rawurlencode( $key ) .'" is too large to be stored into the cache' );
       goto error;
     }
 
@@ -301,16 +344,16 @@ class ShmCache {
       $replacedItem = $this->getItemMetaByOffset( $oldestItemOffset );
       if ( !$replacedItem )
         goto error;
-      if ( !$replacedItem[ 'free' ] ) {
-        if ( !$this->removeItem( $replacedItem[ 'key' ], $replacedItem[ 'offset' ] ) )
+      $replacedItemOffset = $oldestItemOffset;
+      if ( $replacedItem[ 'valsize' ] ) {
+        if ( !$this->removeItem( $replacedItem[ 'key' ], $replacedItemOffset ) )
           goto error;
       }
     }
 
-    $replacedItemOffset = $replacedItem[ 'offset' ];
-    $replacedItemIsFree = $replacedItem[ 'free' ];
-    $nextItemOffset = $replacedItem[ 'nextoffset' ];
+    $replacedItemIsFree = !$replacedItem[ 'valsize' ];
     $allocatedSize = $replacedItem[ 'valallocsize' ];
+    $nextItemOffset = $this->getNextItemOffset( $replacedItemOffset, $allocatedSize );
 
     // When the maximum amount of cached items is reached, and we're adding
     // a new item (rather than just writing into an existing item's memory
@@ -320,34 +363,43 @@ class ShmCache {
     if ( !$existingItem && $this->getItemCount() >= self::MAX_ITEMS ) {
 
       $itemsToRemove = self::FULL_CACHE_REMOVED_ITEMS;
-      $removedOffset = $replacedItemOffset;
+
+      // $replacedItem is the oldest item in the buffer, and was already
+      // removed above
+      if ( !$replacedItemIsFree )
+        --$itemsToRemove;
+
+      $removedOffset = $this->getNextItemOffset( $replacedItemOffset, $replacedItem[ 'valallocsize' ] );
       $loopedAround = false;
 
       while ( $itemsToRemove > 0 ) {
-        $removedItem = $this->getItemMetaByOffset( $removedOffset );
-        if ( !$removedItem )
-          goto error;
-        if ( !$removedItem[ 'free' ] ) {
-          if ( !$this->removeItem( $removedItem[ 'key' ], $removedItem[ 'offset' ] ) ) {
-            goto error;
-          }
-          --$itemsToRemove;
-        }
-        $removedOffset = $removedItem[ 'nextoffset' ];
+
         // Loop around if we reached the last item in the values memory area
         if ( !$removedOffset ) {
-          // TODO: figure out when this conditional returns true, because
-          // sometimes it does. A bug or intended behavior?
           if ( $loopedAround ) {
-            $this->dumpStats();
-            throw new \Exception( 'TODO FIXME' );
+            trigger_error( 'Possible memory corruption. Unexpectedly found no next item for item "'.
+              rawurlencode( $removedItem[ 'key' ] ) .'"' );
+            break;
           }
           $removedOffset = SHM_CACHE_VALUES_START;
           $loopedAround = true;
         }
+
         // If we reach the offset the we start at, we've seen all the elements
         if ( $loopedAround && $removedOffset >= $replacedItemOffset )
           break;
+
+        $removedItem = $this->getItemMetaByOffset( $removedOffset );
+        if ( !$removedItem )
+          goto error;
+        if ( $removedItem[ 'valsize' ] ) {
+          if ( !$this->removeItem( $removedItem[ 'key' ], $removedOffset ) ) {
+            goto error;
+          }
+          --$itemsToRemove;
+        }
+
+        $removedOffset = $this->getNextItemOffset( $removedOffset, $removedItem[ 'valallocsize' ] );
       }
 
       $allocatedSize = $this->mergeItemWithNextFreeValueSlots( $replacedItemOffset );
@@ -376,14 +428,14 @@ class ShmCache {
         $firstItem = $this->getItemMetaByOffset( SHM_CACHE_VALUES_START );
         if ( !$firstItem )
           goto error;
-        if ( !$firstItem[ 'free' ] ) {
-          if ( !$this->removeItem( $firstItem[ 'key' ], $firstItem[ 'offset' ] ) )
+        if ( $firstItem[ 'valsize' ] ) {
+          if ( !$this->removeItem( $firstItem[ 'key' ], SHM_CACHE_VALUES_START ) )
             goto error;
         }
         $replacedItemOffset = SHM_CACHE_VALUES_START;
         $replacedItemIsFree = true;
-        $nextItemOffset = $firstItem[ 'nextoffset' ];
         $allocatedSize = $firstItem[ 'valallocsize' ];
+        $nextItemOffset = $this->getNextItemOffset( SHM_CACHE_VALUES_START, $allocatedSize );
 
         continue;
       }
@@ -392,14 +444,15 @@ class ShmCache {
       if ( !$nextItem )
         goto error;
 
-      // Merge the next item's space into this item
-      $allocatedSize += SHM_CACHE_ITEM_META_SIZE + $nextItem[ 'valallocsize' ];
-      $nextItemOffset = $nextItem[ 'nextoffset' ];
-
-      if ( !$nextItem[ 'free' ] ) {
-        if ( !$this->removeItem( $nextItem[ 'key' ], $nextItem[ 'offset' ] ) )
+      if ( $nextItem[ 'valsize' ] ) {
+        if ( !$this->removeItem( $nextItem[ 'key' ], $nextItemOffset ) )
           goto error;
       }
+
+      // Merge the next item's space into this item
+      $itemAllocSize = $nextItem[ 'valallocsize' ];
+      $allocatedSize += SHM_CACHE_ITEM_META_SIZE + $itemAllocSize;
+      $nextItemOffset = $this->getNextItemOffset( $nextItemOffset, $itemAllocSize );
     }
 
     $splitSlotSize = $allocatedSize - $newValueSize;
@@ -490,14 +543,19 @@ class ShmCache {
     $index = $this->getHashTableBaseIndex( $key );
     $metaOffset = $this->getItemMetaOffsetByHashTableIndex( $index );
 
-    for ( $i = 0; $metaOffset && $i < SHM_CACHE_KEYS_SLOTS; ++$i ) {
+    if ( !$metaOffset )
+      return -1;
+
+    for ( $i = 0; $i < SHM_CACHE_KEYS_SLOTS; ++$i ) {
 
       $item = $this->getItemMetaByOffset( $metaOffset );
-      if ( !$item[ 'free' ] && $item[ 'key' ] === $key )
+      if ( $item[ 'valsize' ] && $item[ 'key' ] === $key )
         return $index;
 
       $index = ( $index + 1 ) % SHM_CACHE_KEYS_SLOTS;
       $metaOffset = $this->getItemMetaOffsetByHashTableIndex( $index );
+      if ( !$metaOffset )
+        break;
     }
 
     return -1;
@@ -524,19 +582,19 @@ class ShmCache {
     // Key doesn't exist in the hash table. This item was probably already
     // removed, or never existed.
     if ( $hashTableIndex < 0 ) {
-      trigger_error( 'Item "'. $key .'" has no element in the hash table' );
+      trigger_error( 'Item "'. rawurlencode( $key ) .'" has no element in the hash table' );
       return false;
     }
 
     // Clear the hash table key
     if ( !$this->writeItemKey( $hashTableIndex, 0 ) ) {
-      trigger_error( 'Could not free the item "'. $key .'" key' );
+      trigger_error( 'Could not free the item "'. rawurlencode( $key ) .'" key' );
       return false;
     }
 
     // Make the value space free by setting the valsize to 0
     if ( shmop_write( $this->block, pack( 'l', 0 ), $itemOffset + self::MAX_KEY_LENGTH + SHM_CACHE_LONG_SIZE ) === false ) {
-      trigger_error( 'Could not free the item "'. $key .'" value' );
+      trigger_error( 'Could not free the item "'. rawurlencode( $key ) .'" value' );
       return false;
     }
 
@@ -565,18 +623,19 @@ class ShmCache {
   private function mergeItemWithNextFreeValueSlots( $itemOffset ) {
 
     $item = $this->getItemMetaByOffset( $itemOffset, false );
-    $nextItemOffset = $item[ 'nextoffset' ];
-    $allocSize = $item[ 'valallocsize' ];
+    $allocSize = $origAllocSize = $item[ 'valallocsize' ];
+    $nextItemOffset = $this->getNextItemOffset( $itemOffset, $allocSize );
 
     while ( $nextItemOffset ) {
       $nextItem = $this->getItemMetaByOffset( $nextItemOffset, false );
-      if ( !$nextItem[ 'free' ] )
+      if ( $nextItem[ 'valsize' ] )
         break;
-      $nextItemOffset = $nextItem[ 'nextoffset' ];
-      $allocSize += SHM_CACHE_ITEM_META_SIZE + $nextItem[ 'valallocsize' ];
+      $thisItemAllocSize = $nextItem[ 'valallocsize' ];
+      $allocSize += SHM_CACHE_ITEM_META_SIZE + $thisItemAllocSize;
+      $nextItemOffset = $this->getNextItemOffset( $nextItemOffset, $thisItemAllocSize );
     }
 
-    if ( $allocSize !== $item[ 'valallocsize' ] ) {
+    if ( $allocSize !== $origAllocSize ) {
       // Resize
       $this->writeItemMeta( $itemOffset, null, $allocSize );
       // Fix the ring buffer pointer
@@ -700,23 +759,6 @@ class ShmCache {
     return unpack( 'l', $data )[ 1 ];
   }
 
-  private function getItemMetaByKey( $key, $withKey = true ) {
-
-    $index = $this->getHashTableIndex( $key );
-    if ( $index < 0 )
-      return false;
-
-    $metaOffset = $this->getItemMetaOffsetByHashTableIndex( $index );
-    if ( $metaOffset <= 0 )
-      return false;
-
-    $item = $this->getItemMetaByOffset( $metaOffset, $withKey );
-    if ( !$item )
-      return false;
-
-    return $item;
-  }
-
   private function getItemMetaByOffset( $offset, $withKey = true ) {
 
     $unpackFormat = 'lvalallocsize/lvalsize/cflags';
@@ -729,25 +771,23 @@ class ShmCache {
 
     $data = shmop_read( $this->block, $readOffset, SHM_CACHE_ITEM_META_SIZE );
 
-    if ( !$data ) {
+    if ( $data === false ) {
       trigger_error( 'Could not read item metadata at offset '. $offset .' (started reading at '. $readOffset .')' );
       return null;
     }
 
-    $unpacked = unpack( $unpackFormat, $data );
-    $unpacked[ 'offset' ] = $offset;
+    return unpack( $unpackFormat, $data );
+  }
+
+  private function getNextItemOffset( $itemOffset, $itemValAllocSize ) {
+
     // If it's the last item in the values area, the next item's offset is 0,
     // which means "none"
-    $nextItemOffset = $offset + SHM_CACHE_ITEM_META_SIZE + $unpacked[ 'valallocsize' ];
-    if ( $nextItemOffset > SHM_CACHE_VALUES_START + SHM_CACHE_VALUES_SIZE -
-      SHM_CACHE_ITEM_META_SIZE - self::MIN_VALUE_SIZE )
-    {
+    $nextItemOffset = $itemOffset + SHM_CACHE_ITEM_META_SIZE + $itemValAllocSize;
+    if ( $nextItemOffset > SHM_CACHE_LAST_ITEM_MAX_OFFSET )
       $nextItemOffset = 0;
-    }
-    $unpacked[ 'nextoffset' ] = $nextItemOffset;
-    $unpacked[ 'free' ] = ( $unpacked[ 'valsize' ] === 0 );
 
-    return $unpacked;
+    return $nextItemOffset;
   }
 
   private function addItemKey( $key, $itemMetaOffset ) {
@@ -782,7 +822,7 @@ class ShmCache {
     $hashTableIndex = $this->getHashTableIndex( $key );
 
     if ( $hashTableIndex < 0 ) {
-      trigger_error( 'Could not get hash table offset for key "'. $key .'"' );
+      trigger_error( 'Could not get hash table offset for key "'. rawurlencode( $key ) .'"' );
       return false;
     }
 
@@ -952,16 +992,16 @@ class ShmCache {
 
       $item = $this->getItemMetaByOffset( $i );
 
-      echo '['. $itemNr++ .'] '. ( $item[ 'free' ] ? '[None]' : $item[ 'key' ] ) .
-        ' (hashidx: '. ( $item[ 'free' ] ? '[None]' : $this->getHashTableIndex( $item[ 'key' ] ) ) .
-        ', offset: '. $item[ 'offset' ] .', nextoffset: '. $item[ 'nextoffset' ] .
+      echo '['. $itemNr++ .'] '. ( !$item[ 'valsize' ] ? '[None]' : $item[ 'key' ] ) .
+        ' (hashidx: '. ( !$item[ 'valsize' ] ? '[None]' : $this->getHashTableIndex( $item[ 'key' ] ) ) .
+        ', offset: '. $i .', nextoffset: '. $this->getNextItemOffset( $i, $item[ 'valallocsize' ] ) .
         ', valallocsize: '. $item[ 'valallocsize' ] .', valsize: '. $item[ 'valsize' ] .')'. PHP_EOL;
 
-      if ( $item[ 'free' ] ) {
+      if ( !$item[ 'valsize' ] ) {
         echo '    [Free space]';
       }
       else {
-        echo '    "'. shmop_read( $this->block, $item[ 'offset' ] + SHM_CACHE_ITEM_META_SIZE, min( 60, $item[ 'valsize' ] ) ) .'"';
+        echo '    "'. shmop_read( $this->block, $i + SHM_CACHE_ITEM_META_SIZE, min( 60, $item[ 'valsize' ] ) ) .'"';
         ++$nonFreeItems;
       }
 

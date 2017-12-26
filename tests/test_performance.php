@@ -22,27 +22,35 @@ $itemsToCreate = 2000;
 $totalSetTimeShm = 0;
 $totalSetTimeMemcached = 0;
 
+$randObj = new stdClass;
+for ( $i = 0; $i < 200; ++$i ) {
+  $key = '';
+  for ( $j = 0; $j < 10; ++$j )
+    $key .= chr( rand( ord( 'a' ), ord( 'z' ) ) );
+  $randObj->$key = [ str_repeat( $key, 100 ) ];
+}
+
 for ( $i = 0; $i < $itemsToCreate; ++$i ) {
 
-  echo 'Set foobar'. $i . PHP_EOL;
-  $valuePre = 'VAL';
-  $valuePost = str_repeat( 'x', Crusse\ShmCache::MAX_VALUE_SIZE - 20 );
+  $value = ( $i % 2 )
+    ? str_repeat( 'x', rand( 1, Crusse\ShmCache::MAX_VALUE_SIZE - 20 ) )
+    : $randObj;
 
   $start = microtime( true );
-  if ( !$cache->set( 'foobar'. $i, $valuePre .' '. $valuePost ) ) {
+  if ( !$cache->set( 'foobar'. $i, $value ) ) {
     $cache->dumpStats();
     throw new \Exception( 'ERROR: Failed setting ShmCache value foobar'. $i );
   }
   $end = ( microtime( true ) - $start );
-  echo 'ShmCache took '. $end .' s'. PHP_EOL;
+  echo $i .' ShmCache set took '. $end .' s'. PHP_EOL;
   $totalSetTimeShm += $end;
 
   $start2 = microtime( true );
-  if ( !$memcached->set( 'foobar'. $i, $valuePre .' '. $valuePost ) ) {
+  if ( !$memcached->set( 'foobar'. $i, $value ) ) {
     throw new \Exception( 'ERROR: Failed setting Memcached value foobar'. $i );
   }
   $end2 = ( microtime( true ) - $start2 );
-  echo 'Memcached took '. $end2 .' s'. PHP_EOL;
+  echo $i .' Memcached set took '. $end2 .' s'. PHP_EOL;
   $totalSetTimeMemcached += $end2;
 }
 
@@ -63,25 +71,23 @@ $totalGetTimeMemcached = 0;
 
 for ( $i = $itemsToCreate - 100; $i < $itemsToCreate; ++$i ) {
 
-  echo 'Get '. $i . PHP_EOL;
-
   $start = microtime( true );
-  if ( !$cache->get( 'foobar'. $i ) ) {
+  if ( !( $val = $cache->get( 'foobar'. $i ) ) ) {
     $cache->dumpStats();
     echo 'ERROR: Failed getting ShmCache value foobar'. $i . PHP_EOL;
     break;
   }
   $end = ( microtime( true ) - $start );
-  echo 'ShmCache took '. $end .' s'. PHP_EOL;
+  echo $i .' ShmCache get took '. $end .' s ('. gettype( $val ) .')'. PHP_EOL;
   $totalGetTimeShm += $end;
 
   $start2 = microtime( true );
-  if ( !$memcached->get( 'foobar'. $i ) ) {
+  if ( !( $val = $memcached->get( 'foobar'. $i ) ) ) {
     echo 'ERROR: Failed getting Memcached value foobar'. $i . PHP_EOL;
     break;
   }
   $end2 = ( microtime( true ) - $start2 );
-  echo 'Memcached took '. $end2 .' s'. PHP_EOL;
+  echo $i .' Memcached get took '. $end2 .' s'. PHP_EOL;
   $totalGetTimeMemcached += $end2;
 }
 
