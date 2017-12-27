@@ -20,11 +20,10 @@ namespace Crusse;
  * memory block and semaphore created by this class, if something goes wrong.
  *
  * It is important that the first instantiation and any further uses of this
- * class are with the same Unix user or group (e.g. 'www-data'), because
- * the shared memory block cannot be deleted (e.g. in destroy()) by another
- * user that is also not part of the original creator's group, at least on
- * Linux. If you have problems removing the memory block created by this class,
- * using `ipcrm` as root is your best bet.
+ * class are with the same Unix user (e.g. 'www-data'), because the shared
+ * memory block cannot be deleted (e.g. in destroy()) by another user, at least
+ * on Linux. If you have problems deleting the memory block created by this
+ * class, using `ipcrm` as root is your best bet.
  *
  *
  * Memory block structure
@@ -973,6 +972,9 @@ class ShmCache {
 
   private function openMemBlock() {
 
+    // TODO: create one block per Unix user? On Linux you cannot delete another
+    // user's memory block, even if it has 0777 perms, so having one mem block
+    // per user would be a workaround (but can easily use too much RAM).
     $tmpFile = '/var/lock/php-shm-cache-87b1dcf602a.lock';
     if ( !file_exists( $tmpFile ) ) {
       touch( $tmpFile );
