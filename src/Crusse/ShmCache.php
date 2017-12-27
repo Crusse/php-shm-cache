@@ -369,7 +369,7 @@ class ShmCache {
     // existing item with the same key. This emulates memcached:
     // https://github.com/memcached/memcached/wiki/Performance#how-it-handles-set-failures
     if ( $newValueSize > self::MAX_VALUE_SIZE ) {
-      trigger_error( 'Given cache item "'. rawurlencode( $key ) .'" is too large ('. round( $newValueSize / 1000, 2 ) .' KB) to be stored into the cache' );
+      trigger_error( 'Item "'. rawurlencode( $key ) .'" is too large ('. round( $newValueSize / 1000, 2 ) .' KB) to cache' );
       goto error;
     }
 
