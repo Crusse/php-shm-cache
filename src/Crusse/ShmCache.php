@@ -11,7 +11,25 @@ namespace Crusse;
  * - FIFO queue: oldest element is evicted first when the cache is full
  * - Uses a hash table (with linear probing) for accessing items quickly
  * - Stores the hash table and items' values in Unix shared memory
- * 
+ *
+ * The same memory block is shared by all instances of ShmCache. This means the
+ * maximum amount of memory used by ShmCache is always DEFAULT_CACHE_SIZE (or
+ * SHM_CACHE_SIZE, if defined).
+ *
+ * You can use the Unix programs `ipcs` and `ipcrm` to list and remove the
+ * memory block and semaphore created by this class, if something goes wrong.
+ *
+ * It is important that the first instantiation and any further uses of this
+ * class are with the same Unix user or group (e.g. 'www-data'), because
+ * the shared memory block cannot be deleted (e.g. in destroy()) by another
+ * user that is also not part of the original creator's group, at least on
+ * Linux. If you have problems removing the memory block created by this class,
+ * using `ipcrm` as root is your best bet.
+ *
+ *
+ * Memory block structure
+ * ----------------------
+ *
  * FIFO queue area:
  * [itemcount][ringbufferpointer]
  *
@@ -19,9 +37,9 @@ namespace Crusse;
  *     keep the hash table load factor below MAX_LOAD_FACTOR.
  *
  *     The ring buffer pointer points to the oldest cache item's value slot.
- *     When the cache is full (SHM_CACHE_MAX_ITEMS or MEM_BLOCK_SIZE has been
- *     reached), the oldest items are removed one by one when adding a new
- *     item, until there is enough space for the new item.
+ *     When the cache is full (SHM_CACHE_MAX_ITEMS or SHM_CACHE_VALUES_SIZE
+ *     has been reached), the oldest items are removed one by one when adding
+ *     a new item, until there is enough space for the new item.
  * 
  * Keys area:
  * [itemmetaoffset,itemmetaoffset,...]
@@ -44,16 +62,13 @@ namespace Crusse;
  *     The value slots are always in the order in which they were added to the
  *     cache, so that we can remove the oldest items when the cache gets full.
  *
- * You can use the Unix programs `ipcs` and `ipcrm` to list and remove the
- * memory block and semaphore created by this class, if something goes wrong.
- *
  */
 class ShmCache {
 
   // Total amount of space to allocate for the shared memory block. This will
   // contain both the keys area and the values area, so the amount allocatable
   // for values will be slightly smaller.
-  const MEM_BLOCK_SIZE = 130000000;
+  const DEFAULT_CACHE_SIZE = 134217728;
   const SAFE_AREA_SIZE = 64;
   // Don't let value allocations become smaller than this, to reduce fragmentation
   const MIN_VALUE_ALLOC_SIZE = 128;
@@ -72,12 +87,14 @@ class ShmCache {
 
   static private $hasLock = false;
 
+  /**
+   * @throws \Exception
+   */
   function __construct() {
 
     self::createDefines();
 
     $this->semaphore = $this->getSemaphore();
-
     if ( !$this->lock() )
       throw new \Exception( 'Could not get a lock' );
 
@@ -119,6 +136,23 @@ class ShmCache {
       300017,
     ];
 
+    // Allow the environment to set the shared memory block size, either via
+    // the SHM_CACHE_SIZE env variable, or the SHM_CACHE_SIZE PHP define
+
+    if ( getenv( 'SHM_CACHE_SIZE' ) )
+      define( 'SHM_CACHE_SIZE', (int) getenv( 'SHM_CACHE_SIZE' ) );
+
+    if ( !defined( 'SHM_CACHE_SIZE' ) ) {
+      define( 'SHM_CACHE_SIZE', self::DEFAULT_CACHE_SIZE );
+    }
+    else if ( !is_int( SHM_CACHE_SIZE ) ) {
+      throw new \InvalidArgumentException( 'SHM_CACHE_SIZE must be an integer' );
+    }
+    else if ( SHM_CACHE_SIZE < 1024 * 1024 * 16 ) {
+      throw new \InvalidArgumentException( 'SHM_CACHE_SIZE must be at least 16 MB, but you defined it as '.
+        round( SHM_CACHE_SIZE / 1000000, 5 ) .' MB' );
+    }
+
     define( 'SHM_CACHE_LONG_SIZE', strlen( pack( 'l', 1 ) ) ); // i.e. sizeof(long) in C
     define( 'SHM_CACHE_CHAR_SIZE', strlen( pack( 'c', 1 ) ) ); // i.e. sizeof(char) in C
 
@@ -137,7 +171,7 @@ class ShmCache {
 
     // Keys area (i.e. cache item hash table)
 
-    $approxValuesAreaSize = self::MEM_BLOCK_SIZE - 100000 * SHM_CACHE_LONG_SIZE;
+    $approxValuesAreaSize = SHM_CACHE_SIZE - 100000 * SHM_CACHE_LONG_SIZE;
     $approxBytesPerValuesAreaItem = SHM_CACHE_ITEM_META_SIZE + self::MIN_VALUE_ALLOC_SIZE * 2;
 
     define( 'SHM_CACHE_MAX_ITEMS', floor( $approxValuesAreaSize / $approxBytesPerValuesAreaItem ) );
@@ -158,7 +192,7 @@ class ShmCache {
     // Values area
 
     define( 'SHM_CACHE_VALUES_START', SHM_CACHE_KEYS_START + SHM_CACHE_KEYS_SIZE + self::SAFE_AREA_SIZE );
-    define( 'SHM_CACHE_VALUES_SIZE', self::MEM_BLOCK_SIZE - SHM_CACHE_VALUES_START );
+    define( 'SHM_CACHE_VALUES_SIZE', SHM_CACHE_SIZE - SHM_CACHE_VALUES_START );
     define( 'SHM_CACHE_LAST_ITEM_MAX_OFFSET', SHM_CACHE_VALUES_START + SHM_CACHE_VALUES_SIZE -
       SHM_CACHE_ITEM_META_SIZE - self::MIN_VALUE_ALLOC_SIZE );
   }
@@ -275,6 +309,30 @@ class ShmCache {
     try {
       $this->destroyMemBlock();
       $this->openMemBlock();
+      $ret = true;
+    }
+    catch ( \Exception $e ) {
+      trigger_error( $e->getMessage() );
+      $ret = false;
+    }
+
+    $this->releaseLock();
+
+    return $ret;
+  }
+
+  /**
+   * Deletes the shared memory block created by this class. This will only
+   * work if the block was created by the same user or group that is currently
+   * running this PHP script.
+   */
+  function destroy() {
+
+    if ( !$this->lock() )
+      return false;
+
+    try {
+      $this->destroyMemBlock();
       $ret = true;
     }
     catch ( \Exception $e ) {
@@ -921,22 +979,39 @@ class ShmCache {
       chmod( $tmpFile, 0777 );
     }
 
-    $blockKey = ftok( $tmpFile, 'z' );
-
+    $blockKey = fileinode( $tmpFile );
     if ( !$blockKey )
       throw new \InvalidArgumentException( 'Invalid shared memory block key' );
 
     $mode = 0777;
-    $block = @shmop_open( $blockKey, "w", $mode, self::MEM_BLOCK_SIZE );
+    // The 'size' parameter is ignored by PHP when 'w' is used:
+    // https://github.com/php/php-src/blob/9e709e2fa02b85d0d10c864d6c996e3368e977ce/ext/shmop/shmop.c#L183
+    $block = @shmop_open( $blockKey, "w", $mode, 0 );
     $isNewBlock = false;
 
+    // If a block exists, but is not SHM_CACHE_SIZE, remove and recreate the
+    // block with the new size
+    if ( $block && shmop_size( $block ) !== SHM_CACHE_SIZE ) {
+
+      trigger_error( 'Destroying and re-creating the memory block. The existing block size is '.
+        shmop_size( $block ) .', but SHM_CACHE_SIZE is '. SHM_CACHE_SIZE .'.' );
+
+      if ( !shmop_delete( $block ) ) {
+        throw new \Exception( 'Could not destroy the memory block. Try running the \'ipcrm\' command as a super-user to remove the memory block listed in the output of \'ipcs\'.' );
+      }
+
+      shmop_close( $block );
+      $block = false;
+    }
+
+    // Create a new block
     if ( !$block ) {
-      $block = shmop_open( $blockKey, "n", $mode, self::MEM_BLOCK_SIZE );
+      $block = shmop_open( $blockKey, "n", $mode, SHM_CACHE_SIZE );
       $isNewBlock = true;
     }
 
     if ( !$block )
-      throw new \Exception( 'Could not create a shared memory block' );
+      throw new \Exception( 'Could not open or create a shared memory block' );
 
     $this->block = $block;
 
@@ -946,9 +1021,10 @@ class ShmCache {
 
   private function destroyMemBlock() {
 
-    // TODO FIXME: this won't work when the current process's owner isn't the
-    // user that created the block, even if the block's permissions are 0777
-    shmop_delete( $this->block );
+    if ( !shmop_delete( $this->block ) ) {
+      throw new \Exception( 'Could not destroy the memory block. Try running the \'ipcrm\' command as a super-user to remove the memory block listed in the output of \'ipcs\'.' );
+    }
+
     shmop_close( $this->block );
     $this->block = null;
   }
@@ -961,11 +1037,11 @@ class ShmCache {
 
     // Clear all bytes in the shared memory block
     $memoryWriteChunk = 1024 * 1024 * 4;
-    for ( $i = 0; $i < self::MEM_BLOCK_SIZE; $i += $memoryWriteChunk ) {
+    for ( $i = 0; $i < SHM_CACHE_SIZE; $i += $memoryWriteChunk ) {
 
       // Last chunk might have to be smaller
-      if ( $i + $memoryWriteChunk > self::MEM_BLOCK_SIZE )
-        $memoryWriteChunk = self::MEM_BLOCK_SIZE - $i;
+      if ( $i + $memoryWriteChunk > SHM_CACHE_SIZE )
+        $memoryWriteChunk = SHM_CACHE_SIZE - $i;
 
       if ( shmop_write( $this->block, pack( 'x'. $memoryWriteChunk ), $i ) === false )
         throw new \Exception( 'Could not write NUL bytes to the memory block' );
