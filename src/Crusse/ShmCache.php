@@ -266,6 +266,14 @@ class ShmCache {
     return $ret;
   }
 
+  function increment( $key ) {
+    // TODO
+  }
+
+  function decrement( $key ) {
+    // TODO
+  }
+
   function delete( $key ) {
 
     if ( !$this->block )
