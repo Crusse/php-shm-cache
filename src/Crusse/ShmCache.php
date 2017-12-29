@@ -266,12 +266,38 @@ class ShmCache {
     return $ret;
   }
 
-  function increment( $key ) {
-    // TODO
+  function increment( $key, $offset = 1, $initialValue = 0 ) {
+
+    if ( !$this->block )
+      throw new \Exception( 'Tried to use a destroyed cache. Please create a new instance of '. __CLASS__ );
+
+    if ( !$this->lock() )
+      return false;
+
+    $key = $this->sanitizeKey( $key );
+    $value = $this->_get( $key );
+    if ( $value === false )
+      $value = $initialValue;
+
+    if ( !is_numeric( $value ) ) {
+      trigger_error( 'The cache item "'. $key .'" is not numeric' );
+      $success = false;
+    }
+    else {
+      $value = max( $value + $offset, 0 );
+      $success = $this->_set( $key, $value );
+    }
+
+    $this->releaseLock();
+
+    if ( $success )
+      return $value;
+
+    return false;
   }
 
-  function decrement( $key ) {
-    // TODO
+  function decrement( $key, $offset = 1, $initialValue = 0 ) {
+    return $this->increment( $key, -$offset, $initialValue );
   }
 
   function delete( $key ) {

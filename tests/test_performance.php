@@ -101,6 +101,14 @@ if ( !$cache->set( 'foobar'. ( $itemsToCreate - 1 ), 'foo' ) )
   echo 'Failed setting value'. PHP_EOL;
 
 echo PHP_EOL;
+$cache->delete( "foo" );
+echo 'increment("foo", 5, 3) == '. var_export( $cache->increment( 'foo', 5, 3 ), true ) . PHP_EOL;
+$cache->delete( "foo" );
+echo 'decrement("foo", 2, 3) == '. var_export( $cache->decrement( 'foo', 2, 3 ), true ) . PHP_EOL;
+$cache->delete( "foo" );
+echo 'decrement("foo", 5, 3) == '. var_export( $cache->decrement( 'foo', 5, 3 ), true ) . PHP_EOL;
+
+echo PHP_EOL;
 echo '----------------------------------------------'. PHP_EOL;
 echo 'Stats:'. PHP_EOL;
 print_r( $cache->getStats() );
