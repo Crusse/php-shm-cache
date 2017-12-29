@@ -6,16 +6,25 @@ ini_set('display_errors', 1);
 ini_set('display_startup_errors', 1);
 error_reporting(E_ALL);
 
-
 $cache = new Crusse\ShmCache();
 $memcached = new Memcached();
 $memcached->addServer( 'localhost', 11211 );
 
 if ( ( @$argc > 1 && $argv[ 1 ] === 'clear' ) || isset( $_REQUEST[ 'clear' ] ) ) {
-  if ( $memcached->flush() && $cache->deleteAll() )
+  if ( $memcached->flush() && $cache->flush() )
     echo 'Deleted all'. PHP_EOL;
   else
     echo 'ERROR: Failed to delete all'. PHP_EOL;
+}
+
+if ( ( @$argc > 1 && $argv[ 1 ] === 'destroy' ) || isset( $_REQUEST[ 'destroy' ] ) ) {
+  if ( $memcached->flush() && $cache->destroy() ) {
+    $cache = new Crusse\ShmCache();
+    echo 'Destroyed memory block'. PHP_EOL;
+  }
+  else {
+    echo 'ERROR: Failed to destroy memory block'. PHP_EOL;
+  }
 }
 
 $itemsToCreate = 2000;
@@ -38,7 +47,6 @@ for ( $i = 0; $i < $itemsToCreate; ++$i ) {
 
   $start = microtime( true );
   if ( !$cache->set( 'foobar'. $i, $value ) ) {
-    $cache->dumpStats();
     throw new \Exception( 'ERROR: Failed setting ShmCache value foobar'. $i );
   }
   $end = ( microtime( true ) - $start );
@@ -60,7 +68,6 @@ for ( $i = $itemsToCreate - 50; $i < $itemsToCreate; ++$i ) {
   $valuePre = '123 ';
   $valuePost = str_repeat( 'x', 1000000 );
   if ( !$cache->set( 'foobar'. $i, $valuePre .' '. $valuePost ) ) {
-    $cache->dumpStats();
     throw new \Exception( 'ERROR: Failed setting ShmCache value foobar'. $i );
   }
 }
@@ -73,7 +80,6 @@ for ( $i = $itemsToCreate - 100; $i < $itemsToCreate; ++$i ) {
 
   $start = microtime( true );
   if ( !( $val = $cache->get( 'foobar'. $i ) ) ) {
-    $cache->dumpStats();
     echo 'ERROR: Failed getting ShmCache value foobar'. $i . PHP_EOL;
     break;
   }
@@ -96,8 +102,8 @@ if ( !$cache->set( 'foobar'. ( $itemsToCreate - 1 ), 'foo' ) )
 
 echo PHP_EOL;
 echo '----------------------------------------------'. PHP_EOL;
-echo 'Debug:'. PHP_EOL;
-//$cache->dumpStats();
+echo 'Stats:'. PHP_EOL;
+print_r( $cache->getStats() );
 
 echo '----------------------------------------------'. PHP_EOL;
 echo 'Total set:'. PHP_EOL;
