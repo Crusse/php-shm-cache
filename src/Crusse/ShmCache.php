@@ -70,7 +70,7 @@ class ShmCache {
   const DEFAULT_CACHE_SIZE = 134217728;
   const SAFE_AREA_SIZE = 64;
   // Don't let value allocations become smaller than this, to reduce fragmentation
-  const MIN_VALUE_ALLOC_SIZE = 128;
+  const MIN_VALUE_ALLOC_SIZE = 64;
   const MAX_VALUE_SIZE = 2097152; // 2 MB
   const FULL_CACHE_REMOVED_ITEMS = 10;
   // Use a low load factor (i.e. make there be many more slots in the hash
@@ -87,6 +87,8 @@ class ShmCache {
   static private $hasLock = false;
 
   /**
+   * @param $desiredSize The size of the shared memory block, which will contain both keys and values. If a block already exists and its size is larger, the block's size will not be reduced. If its size is smaller, it will be enlarged.
+   *
    * @throws \Exception
    */
   function __construct( $desiredSize = self::DEFAULT_CACHE_SIZE ) {
@@ -110,72 +112,6 @@ class ShmCache {
 
     if ( self::$hasLock )
       $this->releaseLock();
-  }
-
-  private function populateSizes() {
-
-    $primes = [
-      5003,
-      10007,
-      20011,
-      30011,
-      40009,
-      50021,
-      75013,
-      100012,
-      125017,
-      150011,
-      200009,
-      250013,
-      300017,
-    ];
-
-    $this->BLOCK_SIZE = shmop_size( $this->block );
-
-    $this->LONG_SIZE = strlen( pack( 'l', 1 ) ); // i.e. sizeof(long) in C
-    $this->CHAR_SIZE = strlen( pack( 'c', 1 ) ); // i.e. sizeof(char) in C
-
-    $keySize = self::MAX_KEY_LENGTH;
-    $allocatedSize = $this->LONG_SIZE;
-    $valueSize = $this->LONG_SIZE;
-    $flagsSize = $this->CHAR_SIZE;
-    $this->ITEM_META_SIZE = $keySize + $allocatedSize + $valueSize + $flagsSize;
-
-    // Metadata area
-
-    $itemCountSize = $this->LONG_SIZE;
-    $ringBufferPtrSize = $this->LONG_SIZE;
-    $getHitsSize = $this->LONG_SIZE;
-    $getMissesSize = $this->LONG_SIZE;
-    $this->METADATA_AREA_START = 0;
-    $this->METADATA_AREA_SIZE = $itemCountSize + $ringBufferPtrSize + $getHitsSize + $getMissesSize;
-
-    // Keys area (i.e. cache item hash table)
-
-    $approxValuesAreaSize = $this->BLOCK_SIZE - 100000 * $this->LONG_SIZE;
-    $approxBytesPerValuesAreaItem = $this->ITEM_META_SIZE + min( 1024, self::MAX_VALUE_SIZE );
-
-    $this->MAX_ITEMS = floor( $approxValuesAreaSize / $approxBytesPerValuesAreaItem );
-    $hashTableSlotCount = ceil( $this->MAX_ITEMS / self::MAX_LOAD_FACTOR );
-
-    foreach ( $primes as $prime ) {
-      if ( $prime >= $hashTableSlotCount ) {
-        $hashTableSlotCount = $prime;
-        break;
-      }
-    }
-
-    $this->KEYS_SLOTS = $hashTableSlotCount;
-    $this->KEYS_START = $this->METADATA_AREA_START + $this->METADATA_AREA_SIZE + self::SAFE_AREA_SIZE;
-    // The hash table values are "pointers", i.e. offsets to the values area
-    $this->KEYS_SIZE = $this->KEYS_SLOTS * $this->LONG_SIZE;
-
-    // Values area
-
-    $this->VALUES_START = $this->KEYS_START + $this->KEYS_SIZE + self::SAFE_AREA_SIZE;
-    $this->VALUES_SIZE = $this->BLOCK_SIZE - $this->VALUES_START;
-    $this->LAST_ITEM_MAX_OFFSET = $this->VALUES_START + $this->VALUES_SIZE -
-      $this->ITEM_META_SIZE - self::MIN_VALUE_ALLOC_SIZE;
   }
 
   function set( $key, $value ) {
@@ -1140,6 +1076,72 @@ class ShmCache {
     return !$isNewBlock;
   }
 
+  private function populateSizes() {
+
+    $primes = [
+      5003,
+      10007,
+      20011,
+      30011,
+      40009,
+      50021,
+      75013,
+      100012,
+      125017,
+      150011,
+      200009,
+      250013,
+      300017,
+    ];
+
+    $this->BLOCK_SIZE = shmop_size( $this->block );
+
+    $this->LONG_SIZE = strlen( pack( 'l', 1 ) ); // i.e. sizeof(long) in C
+    $this->CHAR_SIZE = strlen( pack( 'c', 1 ) ); // i.e. sizeof(char) in C
+
+    $keySize = self::MAX_KEY_LENGTH;
+    $allocatedSize = $this->LONG_SIZE;
+    $valueSize = $this->LONG_SIZE;
+    $flagsSize = $this->CHAR_SIZE;
+    $this->ITEM_META_SIZE = $keySize + $allocatedSize + $valueSize + $flagsSize;
+
+    // Metadata area
+
+    $itemCountSize = $this->LONG_SIZE;
+    $ringBufferPtrSize = $this->LONG_SIZE;
+    $getHitsSize = $this->LONG_SIZE;
+    $getMissesSize = $this->LONG_SIZE;
+    $this->METADATA_AREA_START = 0;
+    $this->METADATA_AREA_SIZE = $itemCountSize + $ringBufferPtrSize + $getHitsSize + $getMissesSize;
+
+    // Keys area (i.e. cache keys hash table)
+
+    $approxValuesAreaSize = $this->BLOCK_SIZE - 100000 * $this->LONG_SIZE;
+    $approxBytesPerValuesAreaItem = $this->ITEM_META_SIZE + min( 1024, self::MAX_VALUE_SIZE );
+
+    $this->MAX_ITEMS = floor( $approxValuesAreaSize / $approxBytesPerValuesAreaItem );
+    $hashTableSlotCount = ceil( $this->MAX_ITEMS / self::MAX_LOAD_FACTOR );
+
+    foreach ( $primes as $prime ) {
+      if ( $prime >= $hashTableSlotCount ) {
+        $hashTableSlotCount = $prime;
+        break;
+      }
+    }
+
+    $this->KEYS_SLOTS = $hashTableSlotCount;
+    $this->KEYS_START = $this->METADATA_AREA_START + $this->METADATA_AREA_SIZE + self::SAFE_AREA_SIZE;
+    // The hash table values are "pointers", i.e. offsets to the values area
+    $this->KEYS_SIZE = $this->KEYS_SLOTS * $this->LONG_SIZE;
+
+    // Values area (i.e. item metadata and the actual cached values)
+
+    $this->VALUES_START = $this->KEYS_START + $this->KEYS_SIZE + self::SAFE_AREA_SIZE;
+    $this->VALUES_SIZE = $this->BLOCK_SIZE - $this->VALUES_START;
+    $this->LAST_ITEM_MAX_OFFSET = $this->VALUES_START + $this->VALUES_SIZE -
+      $this->ITEM_META_SIZE - self::MIN_VALUE_ALLOC_SIZE;
+  }
+
   private function destroyMemBlock() {
 
     if ( !shmop_delete( $this->block ) ) {
@@ -1187,12 +1189,14 @@ class ShmCache {
       'usedHashTableSlots' => 0,
       'hashTableLoadFactor' => 0,
       'hashTableMemorySize' => $this->KEYS_SIZE,
-      'availableValueMemorySize' => $this->VALUES_SIZE,
-      'usedValueMemorySize' => 0,
-      'averageItemValueSize' => 0,
+      'availableValueMemSize' => $this->VALUES_SIZE,
+      'usedValueMemSize' => 0,
+      'avgItemValueSize' => 0,
       'ringBufferPointer' => $this->getRingBufferPointer(),
       'getHitCount' => $this->getGetHits(),
       'getMissCount' => $this->getGetMisses(),
+      'metadataSizePerItem' => $this->ITEM_META_SIZE,
+      'minValueSizePerItem' => self::MIN_VALUE_ALLOC_SIZE,
     ];
 
     for ( $i = $this->KEYS_START; $i < $this->KEYS_START + $this->KEYS_SIZE; $i += $this->LONG_SIZE ) {
@@ -1208,13 +1212,15 @@ class ShmCache {
 
       if ( $item[ 'valsize' ] ) {
         ++$ret->items;
-        $ret->usedValueMemorySize += $item[ 'valsize' ];
+        $ret->usedValueMemSize += $item[ 'valsize' ];
       }
 
       $i += $this->ITEM_META_SIZE + $item[ 'valallocsize' ];
     }
 
-    $ret->averageItemValueSize = $ret->usedValueMemorySize / $ret->items;
+    $ret->avgItemValueSize = ( $ret->items )
+      ? $ret->usedValueMemSize / $ret->items
+      : 0;
 
     return $ret;
   }

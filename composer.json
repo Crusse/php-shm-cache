@@ -1,13 +1,14 @@
 {
   "name": "crusse/shm-cache",
-  "description": "A PHP caching library that stores data in shared memory",
+  "description": "A caching library that stores data in shared memory",
   "version": "1.0.0",
   "require": {
     "php": ">=5.4",
     "symfony/process": "^2.6"
   },
 	"require-dev": {
-		"crusse/job-server": "dev-master"
+		"crusse/job-server": "dev-master",
+    "phpunit/phpunit": "4.8.*"
 	},
   "repositories": [
     {

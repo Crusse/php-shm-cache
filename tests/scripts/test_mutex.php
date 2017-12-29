@@ -1,6 +1,6 @@
 <?php
 
-require_once __DIR__ .'/../vendor/autoload.php';
+require_once __DIR__ .'/../../vendor/autoload.php';
 
 ini_set('display_errors', 1);
 ini_set('display_startup_errors', 1);
@@ -11,7 +11,7 @@ $cache = new Crusse\ShmCache();
 try {
   for ( $j = 0; $j < 100; $j++ ) {
     $server = new Crusse\JobServer\Server( 4 );
-    $server->addWorkerInclude( __DIR__ .'/functions.php' );
+    $server->addWorkerInclude( __DIR__ .'/../functions.php' );
     $server->setWorkerTimeout( 2 );
     for ( $i = 0; $i < 40; $i++ ) {
       $server->addJob( 'mutex_test_func', 'Job '. $i );

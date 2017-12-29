@@ -6,8 +6,8 @@
 $memSize = 1024 * 1024 * 128;
 $elemSize = 64; // Common cache lines are 64 bytes long
 $block1 = shmop_open( ftok( __FILE__, 'a' ), "c", 0666, $memSize );
-$block2 = shmop_open( ftok( __DIR__ .'/cache.php', 'a' ), "c", 0666, $memSize );
-$block3 = shmop_open( ftok( __DIR__ .'/README.md', 'a' ), "c", 0666, $memSize );
+$block2 = shmop_open( ftok( __DIR__ .'/../cache.php', 'a' ), "c", 0666, $memSize );
+$block3 = shmop_open( ftok( __DIR__ .'/../README.md', 'a' ), "c", 0666, $memSize );
 
 for ( $i = 0; $i < floor( $memSize / $elemSize ); ++$i ) {
   foreach ( [ $block1, $block2, $block3 ] as $block ) {

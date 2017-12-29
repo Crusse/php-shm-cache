@@ -1,0 +1,16 @@
+<phpunit
+	bootstrap="tests/bootstrap.php"
+	backupGlobals="false"
+	colors="true"
+	convertErrorsToExceptions="true"
+	convertNoticesToExceptions="true"
+	convertWarningsToExceptions="true"
+>
+	<testsuites>
+		<testsuite>
+			<!-- Will be traversed recursively -->
+      <directory suffix="Test.php">./tests/src/Crusse/ShmCache/Tests</directory>
+		</testsuite>
+	</testsuites>
+</phpunit>
+
