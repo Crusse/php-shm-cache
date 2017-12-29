@@ -1163,6 +1163,7 @@ class ShmCache {
       'hashTableMemorySize' => $this->KEYS_SIZE,
       'availableValueMemorySize' => $this->VALUES_SIZE,
       'usedValueMemorySize' => 0,
+      'averageItemValueSize' => 0
       'ringBufferPointer' => $this->getRingBufferPointer(),
       'getHitCount' => $this->getGetHits(),
       'getMissCount' => $this->getGetMisses(),
@@ -1186,6 +1187,8 @@ class ShmCache {
 
       $i += $this->ITEM_META_SIZE + $item[ 'valallocsize' ];
     }
+
+    $ret->averageItemValueSize = $ret->usedValueMemorySize / $ret->items;
 
     return $ret;
   }
