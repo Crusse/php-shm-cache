@@ -1,8 +1,8 @@
-A caching library for storing data in the operating system's shared memory. The
-data is persisted across multiple runs of a PHP script.
+A caching library for storing data in the operating system's shared memory.
+Data is persisted across multiple runs of a PHP script.
 
 The cached items have no expiration time. The cache has a FIFO queue which
-starts removing the oldest items once the cache gets full.
+starts removing oldest items once the cache gets full.
 
 ## Performance
 
