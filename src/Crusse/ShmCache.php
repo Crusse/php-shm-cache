@@ -1163,7 +1163,7 @@ class ShmCache {
       'hashTableMemorySize' => $this->KEYS_SIZE,
       'availableValueMemorySize' => $this->VALUES_SIZE,
       'usedValueMemorySize' => 0,
-      'averageItemValueSize' => 0
+      'averageItemValueSize' => 0,
       'ringBufferPointer' => $this->getRingBufferPointer(),
       'getHitCount' => $this->getGetHits(),
       'getMissCount' => $this->getGetMisses(),
