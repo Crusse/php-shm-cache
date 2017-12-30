@@ -46,6 +46,16 @@ Add this to your composer.json:
 
 and run `composer install`.
 
+## Supported platforms
+
+Only tested on Debian-based Linux distributions, but should also work on other
+Linuxes.
+
+MacOS is not supported, but adding support for it would probably be quite easy.
+At least the lock file location of /var/lock has to change for MacOS.
+
+Windows is not supported.
+
 ## Usage
 
 ```
