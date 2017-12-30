@@ -9,7 +9,7 @@ error_reporting(E_ALL);
 class NaiveFileCache {
 
   function get( $key ) {
-    $data = @file_get_contents( '/tmp/shm-cache-'. md5( $key ) );
+    $data = @file_get_contents( '/tmp/shm-cache-file-'. md5( $key ) );
     if ( $data !== false ) {
       if ( substr( $data, 0, 5 ) === 'SRLZD' )
         return unserialize( substr( $data, 5 ) );
@@ -21,12 +21,12 @@ class NaiveFileCache {
   function set( $key, $value ) {
     if ( !is_string( $value ) )
       $value = 'SRLZD'. serialize( $value );
-    file_put_contents( '/tmp/shm-cache-'. md5( $key ), $value, LOCK_EX );
+    file_put_contents( '/tmp/shm-cache-file-'. md5( $key ), $value, LOCK_EX );
     return true;
   }
 
   function flush() {
-    foreach ( glob( '/tmp/shm-cache-*' ) as $file )
+    foreach ( glob( '/tmp/shm-cache-file-*' ) as $file )
       unlink( $file );
   }
 }
