@@ -57,7 +57,7 @@ Run `vendor/bin/phpunit`.
 ## Performance
 
 I've measured that this is at least twice as fast as a local Memcached over TCP
-over PHP, both on PHP 5 and PHP 7. The main performance hit is from PHP's
+called from PHP, both on PHP 5 and PHP 7. The main performance hit is from PHP's
 `serialize()` and `unserialize()` when storing non-strings. Strings are stored
 as-is, so they don't have the overhead of `serialize()` and `unserialize()`.
 
