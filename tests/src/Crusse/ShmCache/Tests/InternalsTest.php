@@ -4,6 +4,18 @@ namespace Crusse\ShmCache\Tests;
 
 class InternalsTest extends \PHPUnit\Framework\TestCase {
 
+  function testTooLargeValue() {
+
+    // 16 MB cache
+    $cache = @new \Crusse\ShmCache( 1024 * 1024 * 16 );
+    $this->assertSame( true, $cache->flush() );
+
+    $maxSize = $cache->getStats()->maxItemValueSize;
+
+    $this->assertSame( true, $cache->set( 'foo', str_repeat( 'x', $maxSize ) ) );
+    $this->assertSame( false, @$cache->set( 'foo', str_repeat( 'x', $maxSize + 1 ) ) );
+  }
+
   function testRemoveOldestItemsWhenValueIsAreaFull() {
 
     // 16 MB cache
@@ -53,7 +65,7 @@ class InternalsTest extends \PHPUnit\Framework\TestCase {
     $this->assertSame( true, $cache->flush() );
 
     $stats = $cache->getStats();
-    $minSizePerItem = $stats->metadataSizePerItem + $stats->minValueSizePerItem;
+    $minSizePerItem = $stats->itemMetadataSize + $stats->minItemValueSize;
 
     // If we always hit the memory limit before the item count limit, we cannot
     // test exceeding the item count limit
@@ -81,7 +93,7 @@ class InternalsTest extends \PHPUnit\Framework\TestCase {
     $this->assertSame( true, $cache->flush() );
 
     $stats = $cache->getStats();
-    $minSizePerItem = $stats->metadataSizePerItem + $stats->minValueSizePerItem;
+    $minSizePerItem = $stats->itemMetadataSize + $stats->minItemValueSize;
 
     // If we always hit the memory limit before the item count limit, we cannot
     // test exceeding the item count limit
@@ -92,14 +104,14 @@ class InternalsTest extends \PHPUnit\Framework\TestCase {
     // Try to store more items than there are slots for
     for ( $i = 0; $i < $stats->maxItems + $excess; ++$i ) {
       // Store values with sizes that will either fit fully in
-      // minValueSizePerItem, or exceed that by 1 byte, so that ShmCache will
+      // minItemValueSize, or exceed that by 1 byte, so that ShmCache will
       // have to do splitting and merging of items
-      $this->assertSame( true, $cache->set( 'foo'. $i, str_repeat( 'x', $stats->minValueSizePerItem + rand( 0, 1 ) ) ) );
+      $this->assertSame( true, $cache->set( 'foo'. $i, str_repeat( 'x', $stats->minItemValueSize + rand( 0, 1 ) ) ) );
     }
 
     // We expects at least half of the last stored items to exist in the cache
     for ( $i = $stats->maxItems + $excess - 1, $j = 0; $j < $stats->maxItems / 2; --$i, ++$j ) {
-      $this->assertSame( 0, strpos( $cache->get( 'foo'. $i ), str_repeat( 'x', $stats->minValueSizePerItem ) ) );
+      $this->assertSame( 0, strpos( $cache->get( 'foo'. $i ), str_repeat( 'x', $stats->minItemValueSize ) ) );
     }
 
     $this->assertSame( true, $cache->destroy() );

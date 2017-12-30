@@ -30,3 +30,12 @@ function mutex_test_func( $arg ) {
   return $arg;
 }
 
+function set_random_cache_values( $key ) {
+
+  $cache = new \Crusse\ShmCache;
+  $value = str_repeat( 'x', rand( 1, 1024 ) );
+  $cache->set( $key, $value );
+
+  return $value;
+}
+

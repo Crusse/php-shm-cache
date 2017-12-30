@@ -1195,8 +1195,9 @@ class ShmCache {
       'ringBufferPointer' => $this->getRingBufferPointer(),
       'getHitCount' => $this->getGetHits(),
       'getMissCount' => $this->getGetMisses(),
-      'metadataSizePerItem' => $this->ITEM_META_SIZE,
-      'minValueSizePerItem' => self::MIN_VALUE_ALLOC_SIZE,
+      'itemMetadataSize' => $this->ITEM_META_SIZE,
+      'minItemValueSize' => self::MIN_VALUE_ALLOC_SIZE,
+      'maxItemValueSize' => self::MAX_VALUE_SIZE,
     ];
 
     for ( $i = $this->KEYS_START; $i < $this->KEYS_START + $this->KEYS_SIZE; $i += $this->LONG_SIZE ) {
