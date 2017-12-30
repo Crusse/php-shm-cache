@@ -46,6 +46,24 @@ Add this to your composer.json:
 
 and run `composer install`.
 
+## Usage
+
+```
+$cache = new \Crusse\ShmCache;
+$cache->set( 'foo', 'bar' );
+$value = $cache->get( 'foo' );
+$cache->delete( 'foo' );
+```
+
+Or if you need to define the shared memory block's size:
+
+```
+// 512 MiB cache
+$cache = new \Crusse\ShmCache( 1024 * 1024 * 512 );
+```
+
+See the ShmCache class's file for details.
+
 ## Running unit tests
 
 Run `vendor/bin/phpunit`.

@@ -71,7 +71,7 @@ class ShmCache {
   const SAFE_AREA_SIZE = 64;
   // Don't let value allocations become smaller than this, to reduce fragmentation
   const MIN_VALUE_ALLOC_SIZE = 64;
-  const MAX_VALUE_SIZE = 2097152; // 2 MB
+  const MAX_VALUE_SIZE = 2097152; // 2 MiB
   const FULL_CACHE_REMOVED_ITEMS = 10;
   // Use a low load factor (i.e. make there be many more slots in the hash
   // table than the maximum amount of items we'll be storing). 0.5 or less.
@@ -1024,8 +1024,8 @@ class ShmCache {
       throw new \InvalidArgumentException( '$desiredSize must be an integer' );
     }
     else if ( $desiredSize < 1024 * 1024 * 16 ) {
-      throw new \InvalidArgumentException( '$desiredSize must be at least 16 MB, but you defined it as '.
-        round( $desiredSize / 1000000, 5 ) .' MB' );
+      throw new \InvalidArgumentException( '$desiredSize must be at least 16 MiB, but you defined it as '.
+        round( $desiredSize / 1024 / 1024, 5 ) .' MiB' );
     }
 
     $tmpFile = '/var/lock/php-shm-cache-87b1dcf602a.lock';
