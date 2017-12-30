@@ -11,6 +11,9 @@ over PHP, both on PHP 5 and PHP 7. The main performance hit is from PHP's
 `serialize()` and `unserialize()` when storing non-strings. Strings are stored
 as-is, so they don't have the overhead of `serialize()` and `unserialize()`.
 
+Run `php tests/scripts/test_performance.php` on your own machine to test. Make
+sure to have Memcached installed first.
+
 ## Installing
 
 Add this to your composer.json:
