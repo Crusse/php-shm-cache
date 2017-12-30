@@ -142,6 +142,8 @@ for ( $i = $itemsToCreate - 100; $i < $itemsToCreate; ++$i ) {
   $totalGetTimeFileCache += $end3;
 }
 
+$fileCache->flush();
+
 if ( !$cache->set( 'foobar'. ( $itemsToCreate - 1 ), 'foo' ) )
   echo 'Failed setting value'. PHP_EOL;
 
