@@ -91,7 +91,7 @@ class ShmCache {
    *
    * @throws \Exception
    */
-  function __construct( $desiredSize = self::DEFAULT_CACHE_SIZE ) {
+  function __construct( $desiredSize = 0 ) {
 
     $this->semaphore = $this->getSemaphore();
     if ( !$this->lock() )
@@ -1023,7 +1023,7 @@ class ShmCache {
     if ( !is_int( $desiredSize ) ) {
       throw new \InvalidArgumentException( '$desiredSize must be an integer' );
     }
-    else if ( $desiredSize < 1024 * 1024 * 16 ) {
+    else if ( $desiredSize && $desiredSize < 1024 * 1024 * 16 ) {
       throw new \InvalidArgumentException( '$desiredSize must be at least 16 MiB, but you defined it as '.
         round( $desiredSize / 1024 / 1024, 5 ) .' MiB' );
     }
@@ -1048,7 +1048,7 @@ class ShmCache {
     // smaller than the desired size. This fails (at least on Linux) if the
     // Unix user trying to delete the block is different than the user that
     // created the block.
-    if ( $block && shmop_size( $block ) < $desiredSize ) {
+    if ( $block && $desiredSize && shmop_size( $block ) < $desiredSize ) {
 
       trigger_error( 'Destroying and re-creating the memory block. The existing block size is '.
         shmop_size( $block ) .', but desired size is '. $desiredSize .'.' );
@@ -1064,7 +1064,7 @@ class ShmCache {
 
     // Create a new block
     if ( !$block ) {
-      $block = shmop_open( $blockKey, "n", $mode, $desiredSize );
+      $block = shmop_open( $blockKey, "n", $mode, ( $desiredSize ) ? $desiredSize : self::DEFAULT_CACHE_SIZE );
       $isNewBlock = true;
     }
 
