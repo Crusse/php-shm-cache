@@ -1007,8 +1007,10 @@ class ShmCache {
 
     $tmpFile = '/var/lock/php-shm-cache-87b1dcf602a-semaphore.lock';
     if ( !file_exists( $tmpFile ) ) {
-      touch( $tmpFile );
-      chmod( $tmpFile, 0777 );
+      if ( !touch( $tmpFile ) )
+        throw new \Exception( 'Could not create '. $tmpFile );
+      if ( !chmod( $tmpFile, 0777 ) )
+        throw new \Exception( 'Could not change permissions of '. $tmpFile );
     }
 
     return sem_get( fileinode( $tmpFile ), 1, 0777, 1 );
@@ -1030,8 +1032,10 @@ class ShmCache {
 
     $tmpFile = '/var/lock/php-shm-cache-87b1dcf602a.lock';
     if ( !file_exists( $tmpFile ) ) {
-      touch( $tmpFile );
-      chmod( $tmpFile, 0777 );
+      if ( !touch( $tmpFile ) )
+        throw new \Exception( 'Could not create '. $tmpFile );
+      if ( !chmod( $tmpFile, 0777 ) )
+        throw new \Exception( 'Could not change permissions of '. $tmpFile );
     }
 
     $blockKey = fileinode( $tmpFile );
