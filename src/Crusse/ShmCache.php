@@ -97,6 +97,9 @@ class ShmCache {
     if ( !$this->lock() )
       throw new \Exception( 'Could not get a lock' );
 
+    // TODO: don't create the block in openMemBlock(), but just try to open it.
+    // We only require a read lock for that. If the memory block is missing,
+    // acquire a write lock and create it.
     $openedExistingBlock = $this->openMemBlock( $desiredSize );
     $this->populateSizes();
     if ( !$openedExistingBlock )
@@ -969,10 +972,12 @@ class ShmCache {
   // TODO: allow parallel reading. Currently only one simultaneous reader is
   // allowed. Use shared memory variables for the amount of readers and
   // writers, and protect i/o to those variables with sem_acquire().
-  // TODO: test if the current locking is actually a bottleneck. Implementing
+  // TODO: test if the current locking is actually a bottleneck (edit: yes,
+  // a major bottleneck when doing parallel HTTP requests). Implementing
   // the multiple-readers-single-writer lock mentioned above will run into
   // problems, when the PHP script crashes mid-way and doesn't decrement the
-  // readers or writers count.
+  // readers or writers count. Maybe decrement the counts whenever acquiring
+  // a lock times out.
   private function lock() {
 
     if ( self::$hasLock ) {
