@@ -130,16 +130,16 @@ class ShmCache {
     $key = $this->sanitizeKey( $key );
     $ret = $this->_get( $key, $retIsCacheHit );
 
-    if ( !$this->lock->getWriteLock() )
-      return false;
+    //if ( !$this->lock->getWriteLock() )
+    //  return false;
 
-    if ( $retIsCacheHit )
-      $this->setGetHits( $this->getGetHits() + 1 );
-    else
-      $this->setGetMisses( $this->getGetMisses() + 1 );
+    //if ( $retIsCacheHit )
+    //  $this->setGetHits( $this->getGetHits() + 1 );
+    //else
+    //  $this->setGetMisses( $this->getGetMisses() + 1 );
 
-    if ( !$this->lock->releaseWriteLock() )
-      return false;
+    //if ( !$this->lock->releaseWriteLock() )
+    //  return false;
 
     return $ret;
   }
