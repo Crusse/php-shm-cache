@@ -138,9 +138,19 @@ class ShmCache {
     if ( !$this->lock->getReadLock() )
       return false;
 
-    $ret = $this->_get( $key );
+    $ret = $this->_get( $key, $retIsCacheHit );
 
     $this->lock->releaseReadLock();
+
+    if ( !$this->lock->getWriteLock() )
+      return false;
+
+    if ( $retIsCacheHit )
+      $this->setGetHits( $this->getGetHits() + 1 );
+    else
+      $this->setGetMisses( $this->getGetMisses() + 1 );
+
+    $this->lock->releaseWriteLock();
 
     return $ret;
   }
@@ -212,7 +222,7 @@ class ShmCache {
     if ( !$this->lock->getWriteLock() )
       return false;
 
-    $value = $this->_get( $key );
+    $value = $this->_get( $key, $retIsCacheHit );
     if ( $value === false )
       $value = $initialValue;
 
@@ -321,11 +331,11 @@ class ShmCache {
     return $ret;
   }
 
-  private function _get( $key ) {
+  private function _get( $key, &$retIsCacheHit ) {
 
     $index = $this->getHashTableIndex( $key );
     $ret = false;
-    $cacheHit = false;
+    $retIsCacheHit = false;
 
     if ( $index >= 0 ) {
 
@@ -344,7 +354,7 @@ class ShmCache {
             $ret = false;
           }
           else {
-            $cacheHit = true;
+            $retIsCacheHit = true;
             $ret = ( $item[ 'flags' ] & self::FLAG_SERIALIZED )
               ? unserialize( $data )
               : $data;
@@ -352,11 +362,6 @@ class ShmCache {
         }
       }
     }
-
-    if ( $cacheHit )
-      $this->setGetHits( $this->getGetHits() + 1 );
-    else
-      $this->setGetMisses( $this->getGetMisses() + 1 );
 
     return $ret;
   }
@@ -1025,8 +1030,16 @@ class ShmCache {
     $this->populateSizes();
 
     // A new memory block. Write initial values.
-    if ( !$opened )
+    if ( !$opened ) {
+
+      if ( !$this->lock->getWriteLock() )
+        throw new \Exception( 'Could not get a lock' );
+
       $this->clearMemBlock();
+
+      if ( !$this->lock->releaseWriteLock() )
+        throw new \Exception( 'Could not release a lock' );
+    }
 
     return (bool) $this->shm;
   }
