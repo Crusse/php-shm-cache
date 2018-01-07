@@ -103,7 +103,6 @@ class ShmCache {
     $this->lock = new ShmCache\Lock();
 
     $this->initMemBlock( $desiredSize );
-    $this->populateSizes();
   }
 
   function __destruct() {
@@ -996,6 +995,7 @@ class ShmCache {
         if ( shmop_delete( $this->shm ) ) {
           shmop_close( $this->shm );
           $this->shm = false;
+          $opened = false;
         }
         else {
           trigger_error( 'Could not delete the memory block. Falling back to using the existing, smaller-than-desired block.' );
@@ -1011,7 +1011,7 @@ class ShmCache {
         throw new \Exception( 'Could not release a lock' );
     }
 
-    if ( !$this->shm ) {
+    if ( !$opened ) {
 
       if ( !$this->lock->getWriteLock() )
         throw new \Exception( 'Could not get a lock' );
@@ -1021,6 +1021,12 @@ class ShmCache {
       if ( !$this->lock->releaseWriteLock() )
         throw new \Exception( 'Could not release a lock' );
     }
+
+    $this->populateSizes();
+
+    // A new memory block. Write initial values.
+    if ( !$opened )
+      $this->clearMemBlock();
 
     return (bool) $this->shm;
   }
@@ -1065,9 +1071,6 @@ class ShmCache {
     $blockKey = $this->getMemBlockKey();
     $mode = 0777;
     $this->shm = shmop_open( $blockKey, "n", $mode, ( $desiredSize ) ? $desiredSize : self::DEFAULT_CACHE_SIZE );
-
-    if ( $this->shm )
-      $this->clearMemBlock();
 
     return (bool) $this->shm;
   }
