@@ -1066,6 +1066,9 @@ class ShmCache {
     $mode = 0777;
     $this->shm = shmop_open( $blockKey, "n", $mode, ( $desiredSize ) ? $desiredSize : self::DEFAULT_CACHE_SIZE );
 
+    if ( $this->shm )
+      $this->clearMemBlock();
+
     return (bool) $this->shm;
   }
 
