@@ -32,6 +32,7 @@ class Lock {
       return false;
     }
 
+    // Allow nested write locks
     if ( self::$hasWriteLock ) {
       ++self::$hasWriteLock;
       return true;
@@ -50,6 +51,12 @@ class Lock {
 
   function releaseWriteLock() {
 
+    if ( self::$hasReadLock ) {
+      trigger_error( 'Tried to release a write lock while having a read lock' );
+      return false;
+    }
+
+    // Allow nested write locks
     if ( self::$hasWriteLock > 1 ) {
       --self::$hasWriteLock;
       return true;
@@ -71,10 +78,12 @@ class Lock {
 
   function getReadLock() {
 
-    // Already have an exclusive write lock, so we'll allow this silently
-    if ( self::$hasWriteLock )
-      return true;
+    if ( self::$hasWriteLock ) {
+      trigger_error( 'Tried to acquire read lock even though a write lock is already acquired' );
+      return false;
+    }
 
+    // Allow nested read locks
     if ( self::$hasReadLock ) {
       ++self::$hasReadLock;
       return true;
@@ -92,10 +101,12 @@ class Lock {
 
   function releaseReadLock() {
 
-    // Already have an exclusive write lock, so we'll allow this silently
-    if ( self::$hasWriteLock )
-      return true;
+    if ( self::$hasWriteLock ) {
+      trigger_error( 'Tried to release a write lock while having a read lock' );
+      return false;
+    }
 
+    // Allow nested read locks
     if ( self::$hasReadLock > 1 ) {
       --self::$hasReadLock;
       return true;
