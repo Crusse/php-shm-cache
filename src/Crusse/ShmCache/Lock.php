@@ -13,10 +13,11 @@ class Lock {
   static private $hasWriteLock = 0;
 
   private $lockFile;
+  private $readTryMutex;
 
   function __construct() {
 
-    $this->initLockFile();
+    $this->initMutexes();
   }
 
   function __destruct() {
@@ -36,6 +37,11 @@ class Lock {
     if ( self::$hasWriteLock ) {
       ++self::$hasWriteLock;
       return true;
+    }
+
+    if ( !sem_acquire( $this->readTryMutex ) ) {
+      trigger_error( 'Could not acquire read-try lock' );
+      return false;
     }
 
     // This will block until there are no readers and writers with a lock
@@ -68,6 +74,11 @@ class Lock {
 
     $ret = flock( $this->lockFile, LOCK_UN );
 
+    if ( !sem_release( $this->readTryMutex ) ) {
+      trigger_error( 'Could not release read-try lock' );
+      $ret = false;
+    }
+
     if ( $ret )
       --self::$hasWriteLock;
     else
@@ -89,7 +100,17 @@ class Lock {
       return true;
     }
 
+    if ( !sem_acquire( $this->readTryMutex ) ) {
+      trigger_error( 'Could not acquire read-try lock' );
+      return false;
+    }
+
     $ret = flock( $this->lockFile, LOCK_SH );
+
+    if ( !sem_release( $this->readTryMutex ) ) {
+      trigger_error( 'Could not release read-try lock' );
+      $ret = false;
+    }
 
     if ( $ret )
       ++self::$hasReadLock;
@@ -126,15 +147,18 @@ class Lock {
     return $ret;
   }
 
-  private function initLockFile() {
+  private function initMutexes() {
 
-    $tmpFile = '/var/lock/php-shm-cache-87b1dcf602a-resource-mutex';
+    $resourceMutexFile = '/var/lock/php-shm-cache-87b1dcf602a-resource-mutex';
+    $readTryMutexFile = '/var/lock/php-shm-cache-87b1dcf602a-resource-mutex';
 
-    if ( !file_exists( $tmpFile ) ) {
-      if ( !touch( $tmpFile ) )
-        throw new \Exception( 'Could not create '. $tmpFile );
-      if ( !chmod( $tmpFile, 0777 ) )
-        throw new \Exception( 'Could not change permissions of '. $tmpFile );
+    foreach ( [ $resourceMutexFile, $readTryMutexFile ] as $tmpFile ) {
+      if ( !file_exists( $tmpFile ) ) {
+        if ( !touch( $tmpFile ) )
+          throw new \Exception( 'Could not create '. $tmpFile );
+        if ( !chmod( $tmpFile, 0777 ) )
+          throw new \Exception( 'Could not change permissions of '. $tmpFile );
+      }
     }
 
     // In PHP a process cannot sem_release() a semaphore created by another
@@ -143,9 +167,12 @@ class Lock {
     // instead. See the "global" lock at
     // https://en.wikipedia.org/wiki/Readers%E2%80%93writer_lock#Implementation
     $this->lockFile = fopen( $tmpFile, 'r+' );
-
     if ( !$this->lockFile )
       throw new \Exception( 'Could not open '. $tmpFile );
+
+    $this->readTryMutex = sem_get( fileinode( $readTryMutexFile ), 1, 0777, 1 );
+    if ( !$this->readTryMutex )
+      throw new \Exception( 'Could not get a read-try mutex' );
   }
 }
 
