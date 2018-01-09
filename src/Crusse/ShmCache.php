@@ -123,6 +123,17 @@ class ShmCache {
     $key = $this->sanitizeKey( $key );
     $value = $this->maybeSerialize( $value, $retIsSerialized );
 
+    // TODO: currently we're locking the whole memory block whenever there's
+    // a read or a write. We should probably add multiple locks to only lock a portion
+    // of the memory block. Maybe have separate locks for these (but be careful
+    // with coordinating the different locks):
+    //
+    // [itemcount]
+    // [ringbufferpointer]
+    // [gethits and getmisses]
+    // [A fixed number of slices of the keys area?]
+    // [A fixed number of slices of the values area? How to align locks at value boundaries?]
+    //
     $this->lock->getWriteLock();
     $ret = $this->_set( $key, $value, $retIsSerialized );
     $this->lock->releaseWriteLock();
