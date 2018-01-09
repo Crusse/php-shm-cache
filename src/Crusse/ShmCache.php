@@ -1021,13 +1021,23 @@ class ShmCache {
 
   private function getItemMetaByOffset( $offset, $withKey = true ) {
 
-    $unpackFormat = 'lvalallocsize/lvalsize/cflags';
+    static $unpackFormatNoKey;
+    static $unpackFormatWithKey;
+
+    if ( !isset( $unpackFormatNoKey ) )
+      $unpackFormatNoKey = 'lvalallocsize/lvalsize/cflags';
+    if ( !isset( $unpackFormatWithKey ) )
+      $unpackFormatWithKey = 'A'. self::MAX_KEY_LENGTH .'key/lvalallocsize/lvalsize/cflags';
+
     $readOffset = $offset;
 
-    if ( $withKey )
-      $unpackFormat = 'A'. self::MAX_KEY_LENGTH .'key/'. $unpackFormat;
-    else
+    if ( $withKey ) {
+      $unpackFormat = $unpackFormatWithKey;
+    }
+    else {
+      $unpackFormat = $unpackFormatNoKey;
       $readOffset += self::MAX_KEY_LENGTH;
+    }
 
     $data = shmop_read( $this->shm, $readOffset, $this->ITEM_META_SIZE );
 
