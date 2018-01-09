@@ -39,10 +39,10 @@ class Lock {
       return true;
     }
 
-    if ( !sem_acquire( $this->readTryMutex ) ) {
-      trigger_error( 'Could not acquire read-try lock' );
-      return false;
-    }
+    //if ( !sem_acquire( $this->readTryMutex ) ) {
+    //  trigger_error( 'Could not acquire read-try lock' );
+    //  return false;
+    //}
 
     // This will block until there are no readers and writers with a lock
     $ret = flock( $this->lockFile, LOCK_EX );
@@ -74,10 +74,10 @@ class Lock {
 
     $ret = flock( $this->lockFile, LOCK_UN );
 
-    if ( !sem_release( $this->readTryMutex ) ) {
-      trigger_error( 'Could not release read-try lock' );
-      $ret = false;
-    }
+    //if ( !sem_release( $this->readTryMutex ) ) {
+    //  trigger_error( 'Could not release read-try lock' );
+    //  $ret = false;
+    //}
 
     if ( $ret )
       --self::$hasWriteLock;
@@ -100,17 +100,17 @@ class Lock {
       return true;
     }
 
-    if ( !sem_acquire( $this->readTryMutex ) ) {
-      trigger_error( 'Could not acquire read-try lock' );
-      return false;
-    }
+    //if ( !sem_acquire( $this->readTryMutex ) ) {
+    //  trigger_error( 'Could not acquire read-try lock' );
+    //  return false;
+    //}
 
     $ret = flock( $this->lockFile, LOCK_SH );
 
-    if ( !sem_release( $this->readTryMutex ) ) {
-      trigger_error( 'Could not release read-try lock' );
-      $ret = false;
-    }
+    //if ( !sem_release( $this->readTryMutex ) ) {
+    //  trigger_error( 'Could not release read-try lock' );
+    //  $ret = false;
+    //}
 
     if ( $ret )
       ++self::$hasReadLock;
