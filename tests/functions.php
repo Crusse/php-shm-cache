@@ -39,3 +39,13 @@ function set_random_cache_values( $key ) {
   return $value;
 }
 
+function add_and_set_random_cache_values( $key ) {
+
+  $cache = new \Crusse\ShmCache;
+  $value = str_repeat( 'x', rand( 1, 1024 ) );
+  $cache->add( $key, $value );
+  $cache->set( $key, $value );
+
+  return $value;
+}
+

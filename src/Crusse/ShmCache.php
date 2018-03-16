@@ -39,14 +39,14 @@ namespace Crusse;
  *     When the cache is full (MAX_ITEMS or VALUES_SIZE has been reached), the
  *     oldest items are removed one by one when adding a new item, until there
  *     is enough space for the new item.
- * 
+ *
  * Keys area:
  * [itemmetaoffset,itemmetaoffset,...]
  *
  *     The keys area is a hash table of KEYS_SLOTS items. Our hash table
- *     implementation uses linear probing, so this table is ever filled up to
- *     MAX_LOAD_FACTOR.
- * 
+ *     implementation uses linear probing, so this table is only ever filled up
+ *     to MAX_LOAD_FACTOR.
+ *
  * Values area:
  * [[key,valallocsize,valsize,flags,value],...]
  *
@@ -83,6 +83,18 @@ class ShmCache {
 
   private $shm;
   private $shmKey;
+  // TODO: currently we're locking the whole memory block whenever there's
+  // a read or a write. We should probably add multiple locks to only lock a portion
+  // of the memory block. Maybe have separate locks for these (but be careful
+  // with coordinating the different locks):
+  //
+  // [
+  //   [itemcount]
+  //   [ringbufferpointer]
+  //   [gethits and getmisses]
+  // ]
+  // [A fixed number of slices of the keys area?]
+  // [A fixed number of slices of the values area? How to align locks at value boundaries?]
   private $lock;
   private $getHits = 0;
   private $getMisses = 0;
@@ -102,7 +114,7 @@ class ShmCache {
         round( $desiredSize / 1024 / 1024, 5 ) .' MiB' );
     }
 
-    $this->lock = new ShmCache\Lock();
+    $this->lock = new ShmCache\Lock( 'shmcache' );
 
     $this->initMemBlock( $desiredSize );
   }
@@ -123,17 +135,6 @@ class ShmCache {
     $key = $this->sanitizeKey( $key );
     $value = $this->maybeSerialize( $value, $retIsSerialized );
 
-    // TODO: currently we're locking the whole memory block whenever there's
-    // a read or a write. We should probably add multiple locks to only lock a portion
-    // of the memory block. Maybe have separate locks for these (but be careful
-    // with coordinating the different locks):
-    //
-    // [itemcount]
-    // [ringbufferpointer]
-    // [gethits and getmisses]
-    // [A fixed number of slices of the keys area?]
-    // [A fixed number of slices of the values area? How to align locks at value boundaries?]
-    //
     $this->lock->getWriteLock();
     $ret = $this->_set( $key, $value, $retIsSerialized );
     $this->lock->releaseWriteLock();
@@ -152,13 +153,13 @@ class ShmCache {
     $ret = $this->_get( $key, $retIsSerialized, $retIsCacheHit );
     $this->lock->releaseReadLock();
 
+    if ( $ret && $retIsSerialized )
+      $ret = unserialize( $ret );
+
     if ( $retIsCacheHit )
       ++$this->getHits;
     else
       ++$this->getMisses;
-
-    if ( $ret && $retIsSerialized )
-      $ret = unserialize( $ret );
 
     return $ret;
   }
@@ -540,6 +541,9 @@ class ShmCache {
         }
       }
     }
+
+    // Don't need this anymore
+    unset( $index );
 
     // Note: whenever we cannot store the value to the cache, we remove any
     // existing item with the same key. This emulates memcached:

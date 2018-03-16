@@ -29,7 +29,7 @@ class ParallelismTest extends \PHPUnit\Framework\TestCase {
       $numJobs = 100;
 
       for ( $i = 0; $i < $numJobs; $i++ ) {
-        $server->addJob( 'set_random_cache_values', 'job'. $i );
+        $server->addJob( 'add_and_set_random_cache_values', 'job'. $i );
       }
 
       $res = $server->getOrderedResults();
