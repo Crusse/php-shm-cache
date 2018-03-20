@@ -93,10 +93,10 @@ Example:
 ^       ^       ^       ^       ^
 |       |       |       |       |
 0-------1-------2-------3-------4--------
-|valAddr| null  |valAddr|valAddr|valAddr|
+|valAddr| NULL  |valAddr|valAddr|valAddr|
 -----------------------------------------
 
-Note that there is always at least one null in this table, as the table must
+Note that there is always at least one NULL in this table, as the table must
 never reach a 100% load factor when using open addressing.
 
 - Find table index for key "foo"
@@ -121,7 +121,7 @@ Solutions:
   - Doesn't allow us to keep locks of multiple entries, which would be required
     when merging (non-free) value region chunks
 - Make each hash table entry have its own lock. The precence of at least one
-  null in the table ensures that locks are always acquired left-to-right.
+  NULL in the table ensures that locks are always acquired left-to-right.
   - Would probably require us to create 10k..100k files for flock() or sem_get().
     Would we hit number-of-open-files limits?
 
@@ -239,25 +239,117 @@ Example steps for set():
 
 Separate chaining should make the hash table locking more performant.
 
-Remaining issues:
+We currently use a ring buffer where values are (mostly) in insertion order
+(FIFO).
 
-- When removing oldest items in the ring buffer, we need to lock a hash table
-  entry, but can only do that after locking a value, which results in deadlocks
-  - Hash table entries must always be locked _before_ locking values
-  - What other ways are there to keep track of oldest cache items? We currently
-    use a ring buffer where values are (mostly) in insertion order (FIFO).
-    - 
+When removing oldest items in the ring buffer, we need to lock a hash table
+entry, but can only do that after locking a value, which results in deadlocks.
+Hash table entries must always be locked _before_ locking values.
+
+Maybe some other value memory region architecture makes locking easier.
+
+- What other ways are there to keep track of oldest cache items?
+  - A separate LRU linked list (like Memcached does)
+  - A separate FIFO queue (ring buffer), that points to non-insertion-ordered values
+- How do you easily find/create a new memory chunk for a new value without
+  complicated locking of old values and their hash table entries?
+  - Hash table contains pointers to "structs" in value memory region
+  - Clearing a value "struct" without clearing the pointer creates a dangling pointer
+
 
 A realization: in C you can map structs in shared memory, and when some
 member's data changes in the shared memory block, you can just read the new
 value with obj->member. Our way of using PHP's unpack() is a lot slower and
-creates a thick (slow) layer between PHP and shared memory. This relates to
-the note above about temporarily releasing lock Y and then re-reading the value
-region chunk.
+creates a thick, slow layer between PHP and shared memory, where we basically
+always read copies of the shared memory, and not the shared memory directly.
+This relates to the note above about temporarily releasing lock Y and then
+re-reading the value region chunk.
 
 
 ##############################################################################
-#                   Hash table with separate chaining                        #
+#  Not locking the hash table for the whole duration of value modifications  #
 ##############################################################################
+
+Do we actually need to lock the hash table entry (or its wrapping bucket) for
+the whole duration of modifying the entry's associated value?
+
+...............................................................................
+| Lock A                                 | Lock B                              
+```````````````````````````````````````````````````````````````````````````````
+             ^            ^            ^            ^            ^
+Hash table   |            |            |            |            |
+buckets region            |            |            |            |
+0------------1------------2------------3------------4------------5-------------
+|valAddr,next|valAddr,next|valAddr,next|valAddr,next|valAddr,next|valAddr,next|
+-------------------------------------------------------------------------------
+             |_______________
+                             |                             _____ Ring buffer
+                             |                            |      pointer
+Value region                 v                            v
+0----------------------------1----------------------------2-----------------------------
+|key,allocSize,size,flags,val|key,allocSize,size,flags,val|key,allocSize,size,flags,val|
+----------------------------------------------------------------------------------------
+|                            |                            |
+v                            v                            v
+........................................................................................
+| Lock X                                 | Lock Y                                 |
+````````````````````````````````````````````````````````````````````````````````````````
+
+Example steps for set():
+
+- Compute hash table bucket index (1)
+- Lock A for (!) read
+- Read value address from hash table entry 1
+- (!) Release lock A
+- Possible changes in another process:
+  - add() another cache item
+    - Lock A for write
+    - Set "next" to some address in the separate hash table overflow region
+    - Release lock A
+  - remove() the cache item
+    - Lock A for write
+    - Set hash table entry 1 valAddr to NULL
+    - Release lock A
+    - Lock X for write
+    - Set value chunk 1 size to 0 (free)
+    - Release lock X
+  - Change valAddr of hash table entry 1 to point to value 2
+  - Set valAddr of entry 1 to NULL
+- Lock X for write
+- Read value chunk 1 and see that its key matches
+- If existing chunk is big enough for new value
+  - Write new value to existing chunk
+  - If existing chunk now has enough free space, split the second half into free space
+- Else
+  - Remove value chunk 1
+  - Lock A for write
+  - Set hash table entry 1 valAddr to NULL
+  - Set bucketPreviousEntry->next to this->next
+  - Release lock A
+  - Lock Y+0..N for write
+    - If the already-acquired lock X is among these, it's OK, as we'll use recursive locks
+  - Remove values after the ring buffer pointer, as usual, in a loop:
+    - Remove a value chunk
+    - Lock hash table bucket for write
+    - Set its associated hash table entry valAddr to NULL
+    - Release hash table bucket lock
+  - Release locks Y+0..N
+- Release lock X
+
+One possible race condition:
+- Process A
+  - Update value with a new value
+  - Update value size with new size
+- Process B
+  - Remove hash table entry (set valAddr to NULL)
+  - Set value size to 0 (free)
+
+Problematic if those steps are run in this order:
+- A: Read valAddr from hash table entry
+- B: Set hash table entry valAddr to NULL
+- B: Update size from 456 to 0
+- A: Update size from 123 to 456
+
+The hash table thinks the cache item is removed, but the value memory doesn't.
 
 
