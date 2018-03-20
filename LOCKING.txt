@@ -1,0 +1,263 @@
+This file tells the story of planning more granular locking for ShmCache.
+Locking all memory (hash table region and value region) for all operations is
+really slow when multiple processes try to do operations in parallel.
+
+
+##############################################################################
+#                     Hash table with open addressing                        #
+##############################################################################
+
+.........................................................................
+| Hash table global lock                                                |
+`````````````````````````````````````````````````````````````````````````
+Hash table region
+0-------1-------2-------3-------4-------5-------6-------7-------8-------9
+|valAddr|valAddr|valAddr|valAddr|valAddr|valAddr|valAddr|valAddr|valAddr|
+-------------------------------------------------------------------------
+                              __________________|
+                             |                             _____ Ring buffer
+                             |                            |      pointer
+Value region                 v                            v
+0----------------------------1----------------------------2-----------------------------
+|key,allocSize,size,flags,val|key,allocSize,size,flags,val|key,allocSize,size,flags,val|
+----------------------------------------------------------------------------------------
+|                            |                            |
+v                            v                            v
+........................................................................................
+| Lock X                                 | Lock Y                                 |
+````````````````````````````````````````````````````````````````````````````````````````
+
+Each lock is associated with multiple values, because we're using flock(), and
+we want to limit the amount of lock files.
+
+Example steps for set():
+
+- Compute hash table bucket index (4)
+- Lock hash table for read
+- Lock X for write
+- Read key from value 0
+- Key doesn't match; release lock X
+- Read next hash table entry (index 5)
+- Lock Y for write
+- Read key from value 2
+- Key doesn't match; release lock Y
+- Read next hash table entry (index 6)
+- Lock X for write
+- Read key from value 1
+- Key matches
+- If new value fits into allocSize of value 1
+  - Release hash table lock
+  - Update value size
+  - Write new value
+  - If new size leaves a large-enough gap, split value into new value and free space
+  - Release lock X
+- Else
+  - Release hash table lock
+  - (race condition???)
+  - Lock hash table for write
+    - (deadlock, because locking value first, then hash table???)
+      - Can fix deadlock and race condition by locking initially for write, but
+        that loses read-parallelism
+  - Remove old value
+    - Set value size to 0 (free)
+    - Set hash table entry valAddr to 0 (free)
+    - Merge this space with adjacent free space
+      - Acquire next value space's lock for write
+      - Read next value
+      - If next value is free, merge it to this one
+      - Continue until non-free value is found
+      - Release all free spaces' locks (keep a stack)
+  - Release lock X
+  - (race condition???)
+  - Lock ring buffer location (lock Y) for write
+  - Read value size at ring buffer location
+  - If not large enough for value
+    - Lock ringbuffer+1..N for write until have enough space for new value
+  - Remove all old values
+  - Merge now-free space into one chunk
+  - Lock ringbuffer+N+Nsize-(leftover space); split the chunk into new value and leftover free space
+  - Release all locks Y->
+  - Release hash table lock
+
+
+*********** Why use a global lock for the hash table? ************************
+
+It's difficult/impossible to implement bucket-specific locks with open
+addressing because of deadlocks. 
+
+Example:
+
+.........................................
+| Lock A            | Lock B            |
+`````````````````````````````````````````
+^       ^       ^       ^       ^
+|       |       |       |       |
+0-------1-------2-------3-------4--------
+|valAddr| null  |valAddr|valAddr|valAddr|
+-----------------------------------------
+
+Note that there is always at least one null in this table, as the table must
+never reach a 100% load factor when using open addressing.
+
+- Find table index for key "foo"
+  - Hash "foo" to 2
+  - Acquire lock A
+  - Iterate to 3 (the correct location)
+  - Try to acquire lock B
+- Find table index for key "bar"
+  - Hash "bar" to 4
+  - Acquire lock B
+  - Iterate to 0 (the correct location)
+  - Try to acquire lock A
+- Deadlock
+  - "foo" has A, tries to lock B
+  - "bar" has B, tries to lock A
+
+Solutions:
+
+- Require locks to always be acquired in a certain order (A->B)
+  - Not realistic, as "bar" would beed to acquire A and all preceding locks before B
+- Drop any locks you're holding, if you're trying to acquire a lock
+  - Doesn't allow us to keep locks of multiple entries, which would be required
+    when merging (non-free) value region chunks
+- Make each hash table entry have its own lock. The precence of at least one
+  null in the table ensures that locks are always acquired left-to-right.
+  - Would probably require us to create 10k..100k files for flock() or sem_get().
+    Would we hit number-of-open-files limits?
+
+******************************************************************************
+
+Open addressing doesn't seem to be a good solution in terms of having more
+granular locks for the hash table entries. The root problem is that one
+bucket's entries can be associated with multiple locks, so to lock a single
+bucket, you might need multiple locks, and the order in which those are
+acquired is difficult to enforce, leading to deadlocks. Implementing the
+hash table with separate chaining is a solution (see the next section).
+
+When planning a locking hierarchy, it looks like you should never keep two
+locks of the same level of hierarchy (where the hash table is one level of
+hierarchy, and the value memory region is another level) at the same time, or
+if you do, you need to be 100% sure that the locks are always acquired in the
+same order (A->B->C). It seems a bit easier to keep multiple locks when all of
+them are in different levels of hierarchy, as usually those locks are acquired
+in the same order.
+
+
+##############################################################################
+#                   Hash table with separate chaining                        #
+##############################################################################
+
+With separate chaining we can have one lock fully wrap _all_ of the entries
+in a single hash table bucket, unlike with open addressing, because separate
+chaining gives each bucket and its entries a clear hierarchy.
+
+...............................................................................
+| Lock A                                 | Lock B                              
+```````````````````````````````````````````````````````````````````````````````
+             ^            ^            ^            ^            ^
+Hash table   |            |            |            |            |
+buckets region            |            |            |            |
+0------------1------------2------------3------------4------------5-------------
+|valAddr,next|valAddr,next|valAddr,next|valAddr,next|valAddr,next|valAddr,next|
+-------------------------------------------------------------------------------
+                      |___          ________________
+Hash table                |        |                |
+overflow region           v        |                v
+0------------1------------2------------3------------4------------5-------------
+|valAddr,next|valAddr,next|valAddr,next|valAddr,next|valAddr,next|valAddr,next|
+-------------------------------------------------------------------------------
+                              ______________________|
+                             |                             _____ Ring buffer
+                             |                            |      pointer
+Value region                 v                            v
+0----------------------------1----------------------------2-----------------------------
+|key,allocSize,size,flags,val|key,allocSize,size,flags,val|key,allocSize,size,flags,val|
+----------------------------------------------------------------------------------------
+|                            |                            |
+v                            v                            v
+........................................................................................
+| Lock X                                 | Lock Y                                 |
+````````````````````````````````````````````````````````````````````````````````````````
+
+Each lock is associated with multiple buckets or values, because we're using
+flock(), and we want to limit the amount of lock files.
+
+Example steps for set():
+
+- Compute hash table bucket index (1)
+- Lock A for write
+- Lock X for write
+- Read key from value 0
+- Key doesn't match; release lock X
+- Read next hash table entry from overflow region (index 2)
+- Lock Y for write
+- Read key from value 2
+- Key doesn't match; release lock Y
+- Read next hash table entry from overflow region (index 4)
+- Lock X for write
+- Read key from value 1
+- Key matches
+- If new value fits into allocSize of value 1
+  - Release lock A
+  - Update value size
+  - Write new value
+  - If new size leaves a large-enough gap, split value into new value and free space
+  - Release lock X
+- Else
+  - Remove old value
+    - Set value size to 0 (free)
+    - Set hash table entry valAddr to 0 (free) (OK as we still have lock A)
+    - Merge this space with adjacent free space
+      - Acquire next value space's lock for write
+      - Read next value
+      - If next value is free, merge it to this one
+      - Continue until non-free value is found
+      - Release all free spaces' locks (keep a stack)
+  - Release lock X
+  - (race condition???)
+    - If this is actually a race condition, we can move the lock release
+      further down, with slightly worse performance
+  - Lock ring buffer location (lock Y) for write
+  - Read value key and size at ring buffer location
+    - note: we can't temporarily release lock Y here to first lock the hash table
+      bucket and then the value, to prevent a deadlock, as it causes a race condition
+      - some other process could, for example, split the value at the ring buffer
+        location, requiring us to re-read the value after we re-acquire lock Y,
+        lest we have an old copy of that value chunk's size
+  - Lock hash table bucket for value's key at ring buffer's location, if value is non-free
+    - (deadlock??? locking hash table bucket _after_ value)
+    - There seems to be no way to lock the hash table bucket first without first
+      locking and reading the value's key. The only idea I have is to introduce
+      a global everything-blocking lock for cases like this.
+  - If not large enough for value
+    - Lock ringbuffer+1..N for write until have enough space for new value
+  - Remove all old values at ringbuffer+0..N
+  - Merge now-free space into one chunk
+  - Lock ringbuffer+N+Nsize-(leftover space); split the chunk into new value and leftover free space
+  - Release all locks Y->
+  - Release lock A
+
+Separate chaining should make the hash table locking more performant.
+
+Remaining issues:
+
+- When removing oldest items in the ring buffer, we need to lock a hash table
+  entry, but can only do that after locking a value, which results in deadlocks
+  - Hash table entries must always be locked _before_ locking values
+  - What other ways are there to keep track of oldest cache items? We currently
+    use a ring buffer where values are (mostly) in insertion order (FIFO).
+    - 
+
+A realization: in C you can map structs in shared memory, and when some
+member's data changes in the shared memory block, you can just read the new
+value with obj->member. Our way of using PHP's unpack() is a lot slower and
+creates a thick (slow) layer between PHP and shared memory. This relates to
+the note above about temporarily releasing lock Y and then re-reading the value
+region chunk.
+
+
+##############################################################################
+#                   Hash table with separate chaining                        #
+##############################################################################
+
+
