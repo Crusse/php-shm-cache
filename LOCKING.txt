@@ -336,7 +336,7 @@ Example steps for set():
   - Release locks Y+0..N
 - Release lock X
 
-One possible race condition:
+There's at least one possible race condition:
 - Process A
   - Update value with a new value
   - Update value size with new size
@@ -344,12 +344,27 @@ One possible race condition:
   - Remove hash table entry (set valAddr to NULL)
   - Set value size to 0 (free)
 
-Problematic if those steps are run in this order:
+The problem occurs if those steps are run in this order:
 - A: Read valAddr from hash table entry
 - B: Set hash table entry valAddr to NULL
 - B: Update size from 456 to 0
 - A: Update size from 123 to 456
 
 The hash table thinks the cache item is removed, but the value memory doesn't.
+
+When the hash table entry was locked for the whole duration of the operation,
+it essentially acted as a lock on the whole (virtual) cache item object:
+
+cache_item {
+  hash_table_entry
+  value_chunk
+}
+
+
+##############################################################################
+#       What data structures make variable-size data type locking easy?      #
+##############################################################################
+
+
 
 
