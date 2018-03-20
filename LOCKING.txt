@@ -355,9 +355,11 @@ The hash table thinks the cache item is removed, but the value memory doesn't.
 When the hash table entry was locked for the whole duration of the operation,
 it essentially acted as a lock on the whole (virtual) cache item object:
 
-cache_item {
-  hash_table_entry
-  value_chunk
+hash_table_entry_lock {
+  cache_item {
+    hash_table_entry
+    value_chunk
+  }
 }
 
 
@@ -365,6 +367,69 @@ cache_item {
 #       What data structures make variable-size data type locking easy?      #
 ##############################################################################
 
+To start with a simpler question: what data structures make fixed-size data
+type locking easy?
 
+- A slab allocator like in Memcached, where memory is partitioned into
+  fixed-size (1MB) slabs, which contain as many fixed-size
+  (1MB, 512kB, ..., 80 b) chunks as can fit into one slab. Locking can be done
+  per slab, which locks multiple chunks, and therefore multiple cache items
+  with one lock.
+
+
+##############################################################################
+# How do you make it easy to remove a cache item without complicated locks?  #
+##############################################################################
+
+Our hash table entries look like this:
+
+hash_table_entry {
+  value_ptr
+  next_entry
+}
+
+When the oldest item needs to be removed (to make room for newer items) we need
+some data structure that keeps track of the oldest hash_table_entries.
+
+Removing entries by looping through the value memory region (starting from
+the ring buffer pointer which tracks the oldest item) like we've done so far is
+_backwards_, because the value memory only contains part of a cache item. The
+full data (i.e. the object that wraps together all properties of a single cache
+item) is the hash table entry.
+
+It might get a little awkward to refer to hash table entries when some of the
+entries are in the main hash table bucket region, and some are in the hash
+table overflow region. Therefore it might be better to have all the entries in
+the same region, and then have one more layer of indirection from the bucket
+region to the separate table entries region (i.e. even the first entry in
+a bucket lives in the entries region, not in the buckets region).
+
+Hash table buckets [entryAddr][entryAddr][entryAddr]
+                        |
+                        v
+Hash table entries [valAddr,next][valAddr,next][valAddr,next]
+                    ^       |_____^ ^           ^
+                    |               |_____      |_____
+                    |                     |           |
+Oldest items list  [entryAddr][entryAddr][entryAddr]  |
+                               |______________________|
+
+This way it's easier to have a (linked?) list of the oldest items that is
+always sorted in insertion order (FIFO) or in LRU order.
+
+Do we need to store _all_ (10k, 100k...) entries in that list? If some entry is
+not stored there, does it mean it can't be removed?
+
+Even though you removed 10 elements in succession from the oldest item list,
+it doesn't mean there's now a large-enough value chunk available, as the
+removed values might not have been adjacent to each other. You need a memory
+layout and/or a data structure that makes it easy to find either (1) a free, or
+if not found, (2) one of the oldest blocks of suitable size.
+
+- Free list: a linked list to keep track of free value chunks and their sizes
+- Some kind of a fixed-size or step-sized memory layout for not having to loop
+  through the whole free list or oldest items list to find a proper size block
+  - Slab allocator (Memcached)
+  - Same principle as in a hash table: buckets with their own free lists
 
 
