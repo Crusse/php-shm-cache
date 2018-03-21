@@ -1,6 +1,7 @@
-This file tells the story of planning more granular locking for ShmCache.
-Locking all memory (hash table region and value region) for all operations is
-really slow when multiple processes try to do operations in parallel.
+This file tells the brainstormy/rambly story of planning more granular locking
+for ShmCache. Locking the whole memory (hash table region and value region) for
+all operations is currently really slow whenever multiple processes try to do
+operations in parallel.
 
 
 ##############################################################################
@@ -228,7 +229,9 @@ Example steps for set():
     - (deadlock??? locking hash table bucket _after_ value)
     - There seems to be no way to lock the hash table bucket first without first
       locking and reading the value's key. The only idea I have is to introduce
-      a global everything-blocking lock for cases like this.
+      a global everything-blocking lock for cases like this. A global lock could
+      work if the current shmop_read() and unpack() calls were faster (could try
+      to optimize these).
   - If not large enough for value
     - Lock ringbuffer+1..N for write until have enough space for new value
   - Remove all old values at ringbuffer+0..N
@@ -248,13 +251,40 @@ Hash table entries must always be locked _before_ locking values.
 
 Maybe some other value memory region architecture makes locking easier.
 
-- What other ways are there to keep track of oldest cache items?
-  - A separate LRU linked list (like Memcached does)
-  - A separate FIFO queue (ring buffer), that points to non-insertion-ordered values
 - How do you easily find/create a new memory chunk for a new value without
   complicated locking of old values and their hash table entries?
-  - Hash table contains pointers to "structs" in value memory region
-  - Clearing a value "struct" without clearing the pointer creates a dangling pointer
+  - Hash table currently contains pointers to "structs" in value memory region
+    - Clearing a value "struct" without clearing the pointer creates a dangling pointer
+    - Need to always clear the pointer first, then the struct
+  - A memory pool or slab allocation, i.e., fixed-size block allocation, would
+    help, as there always exists a chunk large enough for a value, and no
+    merging of oldest value chunks would have to be made
+
+- What other ways are there to keep track of oldest cache items?
+  - A separate LRU linked list (like Memcached does)
+  - A separate FIFO queue (ring buffer) that points to values that are spread
+    across the value region in non-insertion-order
+    - Doesn't allow easily merging two adjacent value region chunks
+    - Maybe this queue contains groups of value chunks, and not the chunks
+      themselves; each group only contains _contiguous_ value chunks
+
+- In case we still use dynamic-size block allocation, how do you merge multiple
+  value chunks while keeping a lock for the shortest possible duration?
+  - A separate LRU/FIFO list is problematic, as adjacent queue items don't
+    always point to adjacent value region chunks
+  - Optimize the current merging code
+  - Don't. Always keep a free chunk of the largest possible item size available.
+
+- Is there an easy way to always keep at least one chunk of the largest possible
+  item size available?
+  - A naive implementation would just delete and merge oldest items until there
+    is enough space, like we do now. This is difficult in terms of locking.
+  - Make each chunk a fixed size (largest possible item size). This causes huge
+    internal fragmentation.
+    - Different slabs for most popular chunk sizes fixes this
+
+- Can we use swaps (moves) to make something easier? Swap two value chunks.
+  Swaps don't require pack()/unpack().
 
 
 A realization: in C you can map structs in shared memory, and when some
@@ -272,6 +302,10 @@ re-reading the value region chunk.
 
 Do we actually need to lock the hash table entry (or its wrapping bucket) for
 the whole duration of modifying the entry's associated value?
+
+Tl;dr: yes, because there are subtle race conditions that must be prevented by
+locking all properties (hash table entry, value region chunk) of a cache item
+for the whole duration of an operation.  
 
 ...............................................................................
 | Lock A                                 | Lock B                              
@@ -352,8 +386,8 @@ The problem occurs if those steps are run in this order:
 
 The hash table thinks the cache item is removed, but the value memory doesn't.
 
-When the hash table entry was locked for the whole duration of the operation,
-it essentially acted as a lock on the whole (virtual) cache item object:
+If the hash table entry is locked for the whole duration of the operation, it
+essentially acts as a lock on the whole cache item:
 
 hash_table_entry_lock {
   cache_item {
@@ -364,21 +398,235 @@ hash_table_entry_lock {
 
 
 ##############################################################################
-#       What data structures make variable-size data type locking easy?      #
+#              What features should the memory allocator have?               #
 ##############################################################################
 
-To start with a simpler question: what data structures make fixed-size data
-type locking easy?
+- No/minimal external fragmentation
+- Minimal internal fragmentation
+- Fast insertion of data
+- Fast freeing of chunks
+- Granular locking (don't lock the whole value region for write operations)
+- No merging of chunks (thus not requiring keeping multiple chunk locks
+  simultaneously, which prevents some deadlocks)
+  - However, we can already prevent these deadlocks by acquiring each chunk's
+    lock always in the same order, which is easy to do. Still, it's simpler
+    to just need one value chunk lock when removing a cache item.
 
+Memory allocation strategies:
+
+- A memory pool: https://en.wikipedia.org/wiki/Memory_pool
+  - Probably the same thing as Memcached's slab allocator in practice
 - A slab allocator like in Memcached, where memory is partitioned into
   fixed-size (1MB) slabs, which contain as many fixed-size
   (1MB, 512kB, ..., 80 b) chunks as can fit into one slab. Locking can be done
   per slab, which locks multiple chunks, and therefore multiple cache items
   with one lock.
+  - This is basically half fixed-size allocator, half variable-size allocator
+
+## Idea: a variable-size allocator wrapped by a fixed-size allocator
+
+|__ ____ _ ____|_________ ____|__ _ _________
+|__|____|_|____|_________|____|__|_|_________|
+|Zone 0        |Zone 1        |Zone 2
+               ^
+               |
+          ringBufferPtr
+
+Group chunks into zones (pages) like Memcached does, but when removing oldest
+cache items, don't remove a single chunk, but the whole zone. This gives space
+for any size value (up to the largest possible cache item value). A fixed-size
+zone can act as a mini-region inside which we can do variable-size allocations.
+
+When inserting a new value, insert it to the newest zone that has enough space,
+so that the value is not immediately evicted soon after when an old zone is
+freed to make space for new values.
+
+The whole value memory region can be a ring buffer, with a pointer pointing to
+the newest zone (and the oldest zone can easily be found with
+ringBufferPtr - ZONE_SIZE).
+
+A global free-list keeps track of either the free space of zones, or the free
+space of the chunks in zones. If it keeps track of only the free space of
+a whole zone, then the zone is essentially a stack, and all chunks inside it
+must be contiguous.
+
+If a zone is a stack, a stack pointer points to the start of free space inside
+the zone. Freeing a chunk would require moving memory, though, and PHP has no
+shmop_move() function. Consider some options:
+
+- A zone is not a stack, but contains variable-size chunks anywhere in it
+  - Instead of the global free-list, each zone contains its own free-list,
+    like Memcached
+- A zone is a stack, but when freing a chunk, and there is an adjacent
+  non-free chunk to the right of it, don't free it, and mark it as "dirty".
+  When the chunk to the right of it is freed, also free this chunk. In short,
+  only free a chunk when it's the top chunk in the non-free stack.
+
+I like the second one for its simplicity.
+
+This whole mechanism gives us:
+
+- Minimal/some fragmentation (each zone is filled with variable-size chunks;
+  some internal fragmentation in terms of having unused space in zones, but no
+  internal fragmentation in terms of the top-level allocator, which has
+  fixed-size zones)
+- Fast insertion of data (write the data and advance a zone's internal
+  free-space-starts-here pointer)
+- Fast freeing of chunks (a whole zone is freed at once; basically works like
+  a zone allocator)
+- Granular locking (per zone)
+- No merging of chunks (if no chunk large enough is found, we free the oldest
+  zone and therefore all chunks in it)
+
+A problem remains: how to quickly, and with minimal locking, remove all
+corresponding hash table entries, when a zone's chunks are freed.
 
 
 ##############################################################################
-# How do you make it easy to remove a cache item without complicated locks?  #
+#                      How Memcached handles locking                         #
+##############################################################################
+
+This example is for removing an item.
+
+
+static void process_delete_command(conn *c, token_t *tokens, const size_t ntokens) {
+    char *key = tokens[KEY_TOKEN].value;
+    size_t nkey = tokens[KEY_TOKEN].length;
+
+    item *it = item_get(key, nkey, c, DONT_UPDATE);
+    if (it) {
+        item_unlink(it);
+        item_remove(it);      /* release our reference */
+    }
+}
+
+/*
+ * Unlinks an item from the LRU and hashtable.
+ */
+void item_unlink(item *item) {
+    uint32_t hv = hash(ITEM_key(item), item->nkey);
+    item_lock(hv);
+    do_item_unlink(item, hv);
+    item_unlock(hv);
+}
+
+/*
+ * Decrements the reference count on an item and adds it to the freelist if
+ * needed.
+ */
+void item_remove(item *item) {
+    uint32_t hv;
+    hv = hash(ITEM_key(item), item->nkey);
+
+    item_lock(hv);
+    do_item_remove(item);
+    item_unlock(hv);
+}
+
+void do_item_unlink(item *it, const uint32_t hv) {
+    if ((it->it_flags & ITEM_LINKED) != 0) {
+        it->it_flags &= ~ITEM_LINKED;
+        assoc_delete(ITEM_key(it), it->nkey, hv);
+        item_unlink_q(it);
+        do_item_remove(it);
+    }
+}
+
+void assoc_delete(const char *key, const size_t nkey, const uint32_t hv) {
+    item **before = _hashitem_before(key, nkey, hv);
+    if (*before) {
+        item *nxt = (*before)->h_next;
+        (*before)->h_next = 0;   /* probably pointless, but whatever. */
+        *before = nxt;
+        return;
+    }
+}
+
+static void item_unlink_q(item *it) {
+    pthread_mutex_lock(&lru_locks[it->slabs_clsid]);
+    do_item_unlink_q(it);
+    pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
+}
+
+
+static void do_item_unlink_q(item *it) {
+    item **head, **tail;
+    head = &heads[it->slabs_clsid];
+    tail = &tails[it->slabs_clsid];
+
+    if (*head == it)
+        *head = it->next;
+    if (*tail == it)
+        *tail = it->prev;
+
+    if (it->next) it->next->prev = it->prev;
+    if (it->prev) it->prev->next = it->next;
+    sizes[it->slabs_clsid]--;
+    sizes_bytes[it->slabs_clsid] -= ITEM_ntotal(it);
+}
+
+void do_item_remove(item *it) {
+    if (refcount_decr(it) == 0)
+        item_free(it);
+}
+
+void item_free(item *it) {
+    size_t ntotal = ITEM_ntotal(it);
+
+    /* so slab size changer can tell later if item is already free or not */
+    unsigned int clsid = ITEM_clsid(it);
+    slabs_free(it, ntotal, clsid);
+}
+
+void slabs_free(void *ptr, size_t size, unsigned int id) {
+    pthread_mutex_lock(&slabs_lock);
+    do_slabs_free(ptr, size, id);
+    pthread_mutex_unlock(&slabs_lock);
+}
+
+static void do_slabs_free(void *ptr, const size_t size, unsigned int id) {
+    if (id < POWER_SMALLEST || id > power_largest)
+        return;
+
+    slabclass_t *p = &slabclass[id];
+    item *it = (item *)ptr;
+
+    if ((it->it_flags & ITEM_CHUNKED) == 0) {
+        it->it_flags = ITEM_SLABBED;
+        it->slabs_clsid = 0;
+        it->prev = 0;
+        it->next = p->slots;
+        if (it->next) it->next->prev = it;
+        p->slots = it;
+
+        p->sl_curr++;
+        p->requested -= size;
+    }
+    else {
+        do_slabs_free_chunked(it, size);
+    }
+}
+
+
+From https://github.com/memcached/memcached/blob/master/doc/threads.txt:
+
+    - item_lock must be held while modifying an item.
+    - slabs_lock must be held while modifying the ITEM_SLABBED flag bit within an item.
+    - ITEM_LINKED must not be set before an item has a key copied into it.
+    - items without ITEM_SLABBED set cannot have their memory zeroed out.
+
+    LOCK ORDERS:
+
+    item_lock -> lru_lock -> slabs_lock
+    lru_lock -> item_trylock
+
+When removing an item with process_delete_command():
+
+- TODO
+
+
+##############################################################################
+#    How to implement simple but granular locking, when removing an item?    #
 ##############################################################################
 
 Our hash table entries look like this:
@@ -387,9 +635,6 @@ hash_table_entry {
   value_ptr
   next_entry
 }
-
-When the oldest item needs to be removed (to make room for newer items) we need
-some data structure that keeps track of the oldest hash_table_entries.
 
 Removing entries by looping through the value memory region (starting from
 the ring buffer pointer which tracks the oldest item) like we've done so far is
@@ -423,13 +668,23 @@ not stored there, does it mean it can't be removed?
 Even though you removed 10 elements in succession from the oldest item list,
 it doesn't mean there's now a large-enough value chunk available, as the
 removed values might not have been adjacent to each other. You need a memory
-layout and/or a data structure that makes it easy to find either (1) a free, or
-if not found, (2) one of the oldest blocks of suitable size.
+layout and/or a data structure that makes it easy to find either (1) a free
+chunk of suitable size, or if not found, (2) one of the oldest chunks of
+suitable size.
 
-- Free list: a linked list to keep track of free value chunks and their sizes
+- Free-list: a linked list to keep track of free value chunks and their sizes
 - Some kind of a fixed-size or step-sized memory layout for not having to loop
-  through the whole free list or oldest items list to find a proper size block
+  through the whole free-list or oldest items list to find a proper size block
   - Slab allocator (Memcached)
-  - Same principle as in a hash table: buckets with their own free lists
+  - Same principle as in a hash table: buckets with their own free-lists
+
+Note that splitting value chunks is easy, but merging them is hard. A slab
+allocator doesn't split chunks, and instead allows internal fragmentation.
+
+Why is merging chunks hard?
+- One or both of the merged chunks might be in use (pointed to by a hash table entry)
+  - The pointers need to be NULLed before freeing the value chunks
+- Removing and merging currently takes a lot of time (partly due to difficulty
+  in implementing safe granular locking)
 
 
