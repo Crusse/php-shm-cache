@@ -486,8 +486,31 @@ corresponding hash table entries, when a zone's chunks are freed.
 #                      How Memcached handles locking                         #
 ##############################################################################
 
-This example is for removing an item.
-
+typedef struct _stritem {
+    /* Protected by LRU locks */
+    struct _stritem *next;
+    struct _stritem *prev;
+    /* Rest are protected by an item lock */
+    struct _stritem *h_next;    /* hash chain next */
+    rel_time_t      time;       /* least recent access */
+    rel_time_t      exptime;    /* expire time */
+    int             nbytes;     /* size of data */
+    unsigned short  refcount;
+    uint8_t         nsuffix;    /* length of flags-and-length string */
+    uint8_t         it_flags;   /* ITEM_* above */
+    uint8_t         slabs_clsid;/* which slab class we're in */
+    uint8_t         nkey;       /* key length, w/terminating null and padding */
+    /* this odd type prevents type-punning issues when we do
+     * the little shuffle to save space when not using CAS. */
+    union {
+        uint64_t cas;
+        char end;
+    } data[];
+    /* if it_flags & ITEM_CAS we have 8 bytes CAS */
+    /* then null-terminated key */
+    /* then " flags length\r\n" (no terminating null) */
+    /* then data with terminating \r\n (no terminating null; it's binary!) */
+} item;
 
 static void process_delete_command(conn *c, token_t *tokens, const size_t ntokens) {
     char *key = tokens[KEY_TOKEN].value;
@@ -498,6 +521,41 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
         item_unlink(it);
         item_remove(it);      /* release our reference */
     }
+}
+
+/*
+ * Returns an item if it hasn't been marked as expired,
+ * lazy-expiring as needed.
+ */
+item *item_get(const char *key, const size_t nkey, conn *c, const bool do_update) {
+    uint32_t hv = hash(key, nkey);
+    item_lock(hv);
+    item *it = do_item_get(key, nkey, hv, c, do_update);
+    item_unlock(hv);
+    return it;
+}
+
+/** wrapper around assoc_find which does the lazy expiration logic */
+item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c, const bool do_update) {
+    item *it = assoc_find(key, nkey, hv);
+
+    if (it != NULL)
+        refcount_incr(it);
+
+    if (it != NULL) {
+        was_found = 1;
+        if (item_is_flushed(it)) {
+            do_item_unlink(it, hv);
+            do_item_remove(it);
+            it = NULL;
+        } else if (it->exptime != 0 && it->exptime <= current_time) {
+            do_item_unlink(it, hv);
+            do_item_remove(it);
+            it = NULL;
+        }
+    }
+
+    return it;
 }
 
 /*
@@ -538,7 +596,6 @@ void assoc_delete(const char *key, const size_t nkey, const uint32_t hv) {
         item *nxt = (*before)->h_next;
         (*before)->h_next = 0;   /* probably pointless, but whatever. */
         *before = nxt;
-        return;
     }
 }
 
@@ -547,7 +604,6 @@ static void item_unlink_q(item *it) {
     do_item_unlink_q(it);
     pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
 }
-
 
 static void do_item_unlink_q(item *it) {
     item **head, **tail;
@@ -622,7 +678,46 @@ From https://github.com/memcached/memcached/blob/master/doc/threads.txt:
 
 When removing an item with process_delete_command():
 
-- TODO
+item_get()
+  item_lock() <-------------------------------------------------------- Lock
+  assoc_find()
+    Returns a hash table entry like:
+    struct {
+        *next; <-- refers to the slab's LRU list's next item
+        *prev; <-- refers to the slab's LRU list's prev item
+        *h_next;    /* hash chain next */
+        time;       /* least recent access */
+        exptime;    /* expire time */
+        nbytes;     /* size of data */
+        refcount;
+        nsuffix;    /* length of flags-and-length string */
+        it_flags;   /* ITEM_* above */
+        slabs_clsid;/* which slab class we're in */
+        nkey;       /* key length, w/terminating null and padding */
+        /* Key and data lives somewhere after this struct's end */
+    }
+  item_unlock() <---------------------------------------------------- Unlock
+item_unlink()
+  item_lock() <-------------------------------------------------------- Lock
+  it->it_flags &= ~ITEM_LINKED;
+  Remove this item from hash table bucket linked-list
+  pthread_mutex_lock(&lru_locks[it->slabs_clsid]); <------------------- Lock
+  Remove this item from slab's LRU linked-list
+    (See https://github.com/memcached/memcached/blob/master/doc/new_lru.txt)
+    if (it->next) it->next->prev = it->prev;
+    if (it->prev) it->prev->next = it->next;
+  pthread_mutex_unlock(&lru_locks[it->slabs_clsid]); <--------------- Unlock
+  item_free()
+    pthread_mutex_lock(&slabs_lock); <--------------------------------- Lock
+    slabclass_t *p = &slabclass[it->slabs_clsid];
+    it->it_flags = ITEM_SLABBED;
+    it->slabs_clsid = 0;
+    it->prev = 0;
+    it->next = p->slots;
+    if (it->next) it->next->prev = it;
+    p->slots = it;
+    pthread_mutex_unlock(&slabs_lock); <----------------------------- Unlock
+  item_unlock() <---------------------------------------------------- Unlock
 
 
 ##############################################################################
@@ -644,20 +739,31 @@ item) is the hash table entry.
 
 It might get a little awkward to refer to hash table entries when some of the
 entries are in the main hash table bucket region, and some are in the hash
-table overflow region. Therefore it might be better to have all the entries in
+table overflow region, like I initially mentioned above when introducing
+separate chaining. Therefore it might be better to have all the entries in
 the same region, and then have one more layer of indirection from the bucket
 region to the separate table entries region (i.e. even the first entry in
 a bucket lives in the entries region, not in the buckets region).
 
-Hash table buckets [entryAddr][entryAddr][entryAddr]
-                        |
-                        v
-Hash table entries [valAddr,next][valAddr,next][valAddr,next]
-                    ^       |_____^ ^           ^
-                    |               |_____      |_____
-                    |                     |           |
-Oldest items list  [entryAddr][entryAddr][entryAddr]  |
-                               |______________________|
+Hash table   [entryAddr][entryAddr][entryAddr]
+buckets        __________|
+              |          _____________________
+              v         |                     v
+Hash table   [entryAddr,next][entryAddr,next][entryAddr,next]
+overflow       _______________________________|
+              v
+Value region [key,allocSize,size,flags,val][key,allocSize,size,flags,val]
+
+However, now that we don't need to have extra entries that are always null,
+like we had to do with open addressing, we can make the hash table entries as
+big as needed, without wasting memory. The value region chunk can be the entry:
+
+Hash table   [entryAddr][entryAddr][entryAddr]
+buckets        __________|
+              |
+              v
+Value region [hashNext,key,allocSize,size,flags,val][hashNext,key,allocSize,size,flags,val]
+              |______________________________________^
 
 This way it's easier to have a (linked?) list of the oldest items that is
 always sorted in insertion order (FIFO) or in LRU order.
