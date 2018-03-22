@@ -144,6 +144,8 @@ same order (A->B->C). It seems a bit easier to keep multiple locks when all of
 them are in different levels of hierarchy, as usually those locks are acquired
 in the same order.
 
+(Deadlocks occur because of _lock inversion_.)
+
 
 ##############################################################################
 #                   Hash table with separate chaining                        #
@@ -839,11 +841,11 @@ Process 1 wants to set a new value to an existing item. Process 2 wants to
 read an existing item.
 
 - Process 1: LOCK bucket A
+- Process 2: LOCK bucket B
 - P1: LOCK zone X
 - P1: new value doesn't fit into existing chunk in zone X
 - P1: free zone X first chunk
 - P1: RELEASE zone X
-- Process 2: LOCK bucket B
 - P1: unlink entry from bucket A
   - P1: find bucket for entry->hashNext (bucket B)
   - P1: LOCK bucket B
@@ -870,15 +872,16 @@ read an existing item.
 - P2: RELEASE bucket B
 
 First solution (same as above but added HASH_AND_ZONE_EVICTION_LOCK readers-writer-lock):
+--------------
 
 - Process 1: LOCK HASH_AND_ZONE_EVICTION_LOCK for read
 - P1: LOCK bucket A
+- Process 2: LOCK HASH_AND_ZONE_EVICTION_LOCK for read
+- P2: LOCK bucket B
 - P1: LOCK zone X
 - P1: new value doesn't fit into existing chunk in zone X
 - P1: free zone X first chunk
 - P1: RELEASE zone X
-- Process 2: LOCK HASH_AND_ZONE_EVICTION_LOCK for read
-- P2: LOCK bucket B
 - P1: LOCK HASH_AND_ZONE_EVICTION_LOCK for write
   - Waits until P2 has released its HASH_AND_ZONE_EVICTION_LOCK read lock
 - P2: LOCK zone Y
@@ -904,4 +907,29 @@ First solution (same as above but added HASH_AND_ZONE_EVICTION_LOCK readers-writ
 - P1: RELEASE zone Y
 - P1: RELEASE bucket A
 
+(Btw, if our flock() readers-writer-lock implementation is slow, you might try
+to implement your own with sem_*() and shmop_*(), with a counter and
+an "isLocked" variable in shared memory:
+https://en.wikipedia.org/wiki/Readers%E2%80%93writer_lock#Implementation)
+
+Second solution (always acquire zone lock first, then bucket lock):
+---------------
+
+- do you need a new short-duration lock for the whole hash table, for reading the bucket's head entry?
+  - released already before we even read the entry's chunk
+  - do we need to lock this for write later, again giving us the problem is lock inversion?
+
+Third solution (dirty bit for future removal of chunks, instead of immediate removal):
+--------------
+
+A realization: this problem is essentially the same as in garbage collection
+and reference counting.
+
+https://blogs.msdn.microsoft.com/larryosterman/2005/02/18/concurrency-part-5-what-happens-when-you-cant-avoid-lock-misordering/
+https://en.wikipedia.org/wiki/Reference_counting
+
+we're essentially holding references to our cache item objects, and we can't
+delete an object before all references to it have been NULLed.
+
+mark a zone chunk as dirty with a dirty-bit, and if another process holds a lock to a reference (i.e. hash table bucket), let the other process delete its reference when it sees the dirty bit? if another process doesn't hold a lock to the reference, the current process can NULL it (although can we acquire a lock with flock()'s LOCK_NB?).
 
