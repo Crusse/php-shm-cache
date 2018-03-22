@@ -125,6 +125,7 @@ Solutions:
   NULL in the table ensures that locks are always acquired left-to-right.
   - Would probably require us to create 10k..100k files for flock() or sem_get().
     Would we hit number-of-open-files limits?
+  - TODO: this doesn't actually fix the problem; delete this
 
 ******************************************************************************
 
@@ -423,7 +424,27 @@ Memory allocation strategies:
   with one lock.
   - This is basically half fixed-size allocator, half variable-size allocator
 
-## Idea: a variable-size allocator wrapped by a fixed-size allocator
+How to make removing values fast:
+
+- Free-list: a linked list to keep track of free value chunks and their sizes
+- Some kind of a fixed-size or step-sized memory layout for not having to loop
+  through the whole free-list or oldest items list to find a proper size block
+  - Slab allocator (Memcached)
+  - Same principle as in a hash table: buckets with their own free-lists
+
+Note that splitting value chunks is easy, but merging them is hard. A slab
+allocator doesn't split chunks, and instead has large-enough chunks for any
+value size (up to max size), which is simple but allows internal fragmentation.
+
+Why is merging chunks hard?
+
+- One or both of the merged chunks might be in use (pointed to by a hash table entry)
+  - The pointers need to be NULLed before freeing the value chunks
+- Removing and merging currently takes a lot of time (partly due to difficulty
+  in implementing safe granular locking)
+
+
+***** Idea: a variable-size allocator wrapped by a fixed-size allocator ******
 
 |__ ____ _ ____|_________ ____|__ _ _________
 |__|____|_|____|_________|____|__|_|_________|
@@ -477,6 +498,8 @@ This whole mechanism gives us:
 - Granular locking (per zone)
 - No merging of chunks (if no chunk large enough is found, we free the oldest
   zone and therefore all chunks in it)
+
+******************************************************************************
 
 A problem remains: how to quickly, and with minimal locking, remove all
 corresponding hash table entries, when a zone's chunks are freed.
@@ -676,6 +699,30 @@ From https://github.com/memcached/memcached/blob/master/doc/threads.txt:
     item_lock -> lru_lock -> slabs_lock
     lru_lock -> item_trylock
 
+From thread.c:
+
+		/* item_lock() must be held for an item before any modifications to either its
+		 * associated hash bucket, or the structure itself.
+		 * LRU modifications must hold the item lock, and the LRU lock.
+		 * LRU's accessing items must item_trylock() before modifying an item.
+		 * Items accessible from an LRU must not be freed or modified
+		 * without first locking and removing from the LRU.
+		 */
+
+    void item_lock(uint32_t hv) {
+        pthread_mutex_lock(&item_locks[hv & hashmask(item_lock_hashpower)]);
+    }
+
+    void *item_trylock(uint32_t hv) {
+        pthread_mutex_t *lock = &item_locks[hv & hashmask(item_lock_hashpower)];
+        if (pthread_mutex_trylock(lock) == 0)
+            return lock;
+        return NULL;
+    }
+
+    "If successful, pthread_mutex_lock() and pthread_mutex_unlock() return zero"
+    "pthread_mutex_trylock() returns zero if a lock is acquired"
+
 When removing an item with process_delete_command():
 
 item_get()
@@ -721,42 +768,44 @@ item_unlink()
 
 
 ##############################################################################
-#    How to implement simple but granular locking, when removing an item?    #
+#                 Simpler hash table with separate chaining                  #
 ##############################################################################
 
-Our hash table entries look like this:
+A sidenote: it might get a little awkward to refer to hash table entries when
+some of the entries are in the main hash table bucket region, and some are in
+the hash table overflow region, like I initially mentioned above when introducing
+separate chaining:
 
-hash_table_entry {
-  value_ptr
-  next_entry
-}
+Hash table
+buckets region
+0------------1------------2------------3------------4------------5-------------
+|valAddr,next|valAddr,next|valAddr,next|valAddr,next|valAddr,next|valAddr,next|
+-------------------------------------------------------------------------------
+                      |___          ________________
+Hash table                |        |                |
+overflow region           v        |                v
+0------------1------------2------------3------------4------------5-------------
+|valAddr,next|valAddr,next|valAddr,next|valAddr,next|valAddr,next|valAddr,next|
+-------------------------------------------------------------------------------
 
-Removing entries by looping through the value memory region (starting from
-the ring buffer pointer which tracks the oldest item) like we've done so far is
-_backwards_, because the value memory only contains part of a cache item. The
-full data (i.e. the object that wraps together all properties of a single cache
-item) is the hash table entry.
-
-It might get a little awkward to refer to hash table entries when some of the
-entries are in the main hash table bucket region, and some are in the hash
-table overflow region, like I initially mentioned above when introducing
-separate chaining. Therefore it might be better to have all the entries in
-the same region, and then have one more layer of indirection from the bucket
-region to the separate table entries region (i.e. even the first entry in
-a bucket lives in the entries region, not in the buckets region).
+It might be better to have all the entries in the same region, and then have
+one more layer of indirection from the bucket region to the separate table
+entries region (i.e. even the first entry in a bucket lives in the entries
+region, not in the buckets region).
 
 Hash table   [entryAddr][entryAddr][entryAddr]
 buckets        __________|
-              |          _____________________
-              v         |                     v
-Hash table   [entryAddr,next][entryAddr,next][entryAddr,next]
-overflow       _______________________________|
+              |          ____________________
+              v         |                    v
+Hash table   [valAddr,next][valAddr,next][valAddr,next]
+overflow       ______________________________|
               v
 Value region [key,allocSize,size,flags,val][key,allocSize,size,flags,val]
 
-However, now that we don't need to have extra entries that are always null,
-like we had to do with open addressing, we can make the hash table entries as
-big as needed, without wasting memory. The value region chunk can be the entry:
+However, with separate chaining we don't need to have extra entries that are
+always null, like we had to do with open addressing, we can make the hash table
+entries as big as needed, without wasting memory. The value region chunk can be
+the entry:
 
 Hash table   [entryAddr][entryAddr][entryAddr]
 buckets        __________|
@@ -765,32 +814,94 @@ buckets        __________|
 Value region [hashNext,key,allocSize,size,flags,val][hashNext,key,allocSize,size,flags,val]
               |______________________________________^
 
-This way it's easier to have a (linked?) list of the oldest items that is
-always sorted in insertion order (FIFO) or in LRU order.
 
-Do we need to store _all_ (10k, 100k...) entries in that list? If some entry is
-not stored there, does it mean it can't be removed?
+##############################################################################
+#              How to implement locking when evicting an item?               #
+##############################################################################
 
-Even though you removed 10 elements in succession from the oldest item list,
-it doesn't mean there's now a large-enough value chunk available, as the
-removed values might not have been adjacent to each other. You need a memory
-layout and/or a data structure that makes it easy to find either (1) a free
-chunk of suitable size, or if not found, (2) one of the oldest chunks of
-suitable size.
+Our solution so far has these deadlocks:
 
-- Free-list: a linked list to keep track of free value chunks and their sizes
-- Some kind of a fixed-size or step-sized memory layout for not having to loop
-  through the whole free-list or oldest items list to find a proper size block
-  - Slab allocator (Memcached)
-  - Same principle as in a hash table: buckets with their own free-lists
+Hash table        _A__ _B__
+buckets          |____|____|
+                   ||    |_________
+            _______||_____         |
+           |              |        |
+Item    ___v___ ______ ___v______ _v_
+zones  |_______|______|__________|___|
+       |Zone X        |Zone Y
+                      ^
+                      |
+                 ringBufferPtr
 
-Note that splitting value chunks is easy, but merging them is hard. A slab
-allocator doesn't split chunks, and instead allows internal fragmentation.
+Each bucket and zone has its own lock.
 
-Why is merging chunks hard?
-- One or both of the merged chunks might be in use (pointed to by a hash table entry)
-  - The pointers need to be NULLed before freeing the value chunks
-- Removing and merging currently takes a lot of time (partly due to difficulty
-  in implementing safe granular locking)
+Process 1 wants to set a new value to an existing item. Process 2 wants to
+read an existing item.
+
+- Process 1: LOCK bucket A
+- P1: LOCK zone X
+- P1: new value doesn't fit into existing chunk in zone X
+- P1: free zone X first chunk
+- P1: RELEASE zone X
+- Process 2: LOCK bucket B
+- P1: unlink entry from bucket A
+  - P1: find bucket for entry->hashNext (bucket B)
+  - P1: LOCK bucket B
+    - DEADLOCK
+  - P1: update entry->hashNext->hashPrev
+  - P1: RELEASE bucket B
+- P1: LOCK oldest zone via ringBufferPtr (zone Y)
+- P2: LOCK zone Y
+  - DEADLOCK
+- P1: evict zone Y to make space for new values
+  - P1: free zone Y first chunk
+  - P1: LOCK bucket A (again; recursive lock makes this OK)
+  - P1: unlink entry from bucket A
+  - P1: RELEASE bucket A
+  - P1: free zone Y second chunk
+  - P1: LOCK bucket B
+    - DEADLOCK
+  - P1: unlink entry from bucket B
+  - P1: RELEASE bucket B
+- P1: write new value to zone Y
+- P1: RELEASE zone Y
+- P1: RELEASE bucket A
+- P2: RELEASE zone Y
+- P2: RELEASE bucket B
+
+First solution (same as above but added HASH_AND_ZONE_EVICTION_LOCK readers-writer-lock):
+
+- Process 1: LOCK HASH_AND_ZONE_EVICTION_LOCK for read
+- P1: LOCK bucket A
+- P1: LOCK zone X
+- P1: new value doesn't fit into existing chunk in zone X
+- P1: free zone X first chunk
+- P1: RELEASE zone X
+- Process 2: LOCK HASH_AND_ZONE_EVICTION_LOCK for read
+- P2: LOCK bucket B
+- P1: LOCK HASH_AND_ZONE_EVICTION_LOCK for write
+  - Waits until P2 has released its HASH_AND_ZONE_EVICTION_LOCK read lock
+- P2: LOCK zone Y
+- P2: read value from zone Y
+- P2: RELEASE zone Y
+- P2: RELEASE bucket B
+- P1: unlink entry from bucket A
+  - P1: find bucket for entry->hashNext (bucket B)
+  - P1: LOCK bucket B
+  - P1: update entry->hashNext->hashPrev
+  - P1: RELEASE bucket B
+- P1: LOCK oldest zone via ringBufferPtr (zone Y)
+- P1: evict zone Y to make space for new values
+  - P1: free zone Y first chunk
+  - P1: LOCK bucket A (again; recursive lock makes this OK)
+  - P1: unlink entry from bucket A
+  - P1: RELEASE bucket A
+  - P1: free zone Y second chunk
+  - P1: LOCK bucket B
+  - P1: unlink entry from bucket B
+  - P1: RELEASE bucket B
+- P1: write new value to zone Y
+- P1: RELEASE zone Y
+- P1: RELEASE bucket A
 
 
