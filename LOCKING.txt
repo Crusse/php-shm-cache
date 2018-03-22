@@ -933,3 +933,14 @@ delete an object before all references to it have been NULLed.
 
 mark a zone chunk as dirty with a dirty-bit, and if another process holds a lock to a reference (i.e. hash table bucket), let the other process delete its reference when it sees the dirty bit? if another process doesn't hold a lock to the reference, the current process can NULL it (although can we acquire a lock with flock()'s LOCK_NB?).
 
+can we somehow make sure beforehand, that the oldest zone never has any references to it in the hash table, when we're about to evict the zone?
+  the earliest point to do something about this is when we move the ringBufferPtr
+  at that point, set the zone's chunks' dirty-bits to 1
+  at some point of processing, in any process, remove hash table reference and set chunk's hash-table-reference-deleted bit to 1
+    when that item is accessed via get(), set(), delete(), add()...
+    in some daemon-thread-like maintenance function when ShmCache is being destroyed
+  sometimes all chunks won't have had time to get deleted when we already need the zone's space for new values
+    need a way to wait in a process until the zone is fully evicted
+    evict the remaining chunks in this process, and/or wait currently lock-holding processes to finish
+
+
