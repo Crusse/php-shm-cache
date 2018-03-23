@@ -814,113 +814,276 @@ buckets        __________|
               |
               v
 Value region [hashNext,key,allocSize,size,flags,val][hashNext,key,allocSize,size,flags,val]
-              |______________________________________^
+(entry zones) |______________________________________^
 
 
 ##############################################################################
 #              How to implement locking when evicting an item?               #
 ##############################################################################
 
-Our solution so far has these deadlocks:
+Current situation:
 
 Hash table        _A__ _B__
 buckets          |____|____|
-                   ||    |_________
-            _______||_____         |
-           |              |        |
-Item    ___v___ ______ ___v______ _v_
+             ______|     |_________
+            |                      |
+Entry  |____v__ ______|__________ _v_|
 zones  |_______|______|__________|___|
-       |Zone X        |Zone Y
-                      ^
-                      |
-                 ringBufferPtr
+       |Zone|X    ^   |Zone Y  ^   | |
+            |     |   ^        |   |
+            |     |   |        |   |
+            |    ringBufferPtr |   |
+            |_____|____________|   |
+                  |________________|
 
-Each bucket and zone has its own lock.
+We have these locks:
+- Each bucket has its own lock
+- Each zone has its own lock
+- Ring buffer pointer lock
 
+Example steps when hen trying to update an item in bucket A and in zone X with
+a new value, and the existing chunk doesn't have enough space for it:
+
+- Lock bucket A and zone X
+- Remove existing old chunk in zone X
+- Unlock zone X
+- Race condition?
+  - No, because we only use entry->hashNext after unlocking, and the chunk at
+    entry->hashNext is never moved or removed while bucket A is locked
+  - PRINCIPLE 1: to modify anything else than the ok-to-free dirty-bit in
+    a zone chunk, you need to hold the bucket lock
+  - PRINCIPLE 2: to modify _anything_ in zones, you need to hold the zone's lock
+- Lock zone Y (oldest zone at ring buffer pointer)
+- Remove all items in zone Y
+  - If we naively lock each item's associated bucket here, we deadlock. See
+    "Deadlock" below.
+- Unlock bucket A
+
+
+##############################################################################
+#                    Deadlock (between a zone and a bucket)                  #
+##############################################################################
+
+Hash table        _A__ _B__
+buckets         1|____|____|2______
+             _3____|    ^          |5
+            |           |___6__    |
+Entry  |____v__ ______|________|_ _v_|
+zones  |_______|______|__________|___|
+       |Zone|X        |Zone Y  ^     |
+            |         ^        |
+            |         |        |
+            |    ringBufferPtr |
+            |__________________|
+                      4
+
+Summary:
+- Process 1 has locks A->Y, and wants locks A->Y->B
+- Process 2 has lock B, and wants locks B->Y
+
+Details:
 Process 1 wants to set a new value to an existing item. Process 2 wants to
 read an existing item.
 
-- Process 1: LOCK bucket A
-- Process 2: LOCK bucket B
-- P1: LOCK zone X
+1 P1: LOCK bucket A
+2 P2: LOCK bucket B
+3 P1: LOCK zone X
 - P1: new value doesn't fit into existing chunk in zone X
-- P1: free zone X first chunk
-- P1: RELEASE zone X
+- P1: find zone for entry->hashNext (zone Y)
+- P1: free existing chunk in zone X
+- P1: UNLOCK zone X
 - P1: unlink entry from bucket A
-  - P1: find bucket for entry->hashNext (bucket B)
-  - P1: LOCK bucket B
-    - DEADLOCK
-  - P1: update entry->hashNext->hashPrev
-  - P1: RELEASE bucket B
-- P1: LOCK oldest zone via ringBufferPtr (zone Y)
-- P2: LOCK zone Y
-  - DEADLOCK
-- P1: evict zone Y to make space for new values
+  - P1: LOCK zone for entry->hashNext (zone Y)
+  - P1: set bucket A head to be entry->hashNext->hashNext
+    - No race condition: zone Y's chunk at entry->hashNext->hashNext can't have
+      moved or been removed after unlocking X, as we still have lock A (PRINCIPLE 1)
+  - P1: UNLOCK zone Y
+- P1: LOCK ringBufferPtr (for oldest zone eviction)
+4 P1: LOCK zone Y (oldest zone via ringBufferPtr)
+5 P2: LOCK zone Y
+  - Waits until P1 unlocks Y below
+- P1: evict zone Y to make space for new values (free all chunks)
   - P1: free zone Y first chunk
   - P1: LOCK bucket A (again; recursive lock makes this OK)
-  - P1: unlink entry from bucket A
-  - P1: RELEASE bucket A
+  - P1: unlink entry from bucket A (like above)
+  - P1: UNLOCK bucket A (still holds earlier lock of A)
   - P1: free zone Y second chunk
-  - P1: LOCK bucket B
-    - DEADLOCK
+  6 P1: LOCK bucket B
+    - DEADLOCK: P1 has Y, wants B; P2 has B, wants Y
   - P1: unlink entry from bucket B
-  - P1: RELEASE bucket B
+  - P1: UNLOCK bucket B
+- P1: ++ringBufferPtr
 - P1: write new value to zone Y
-- P1: RELEASE zone Y
-- P1: RELEASE bucket A
-- P2: RELEASE zone Y
-- P2: RELEASE bucket B
+- P1: UNLOCK zone Y
+- P1: UNLOCK ringBufferPtr
+- P1: UNLOCK bucket A
+- P2: read second chunk of zone Y
+  - RACE CONDITION due to P1 having removed all chunks, although this is fixed
+    when the DEADLOCK is fixed; see "trylock" below
+- P2: UNLOCK zone Y
+- P2: UNLOCK bucket B
 
-First solution (same as above but added HASH_AND_ZONE_EVICTION_LOCK readers-writer-lock):
---------------
+PRINCIPLE 3: the lock order between a bucket and a zone lock must always be
+bucket->zone, not zone->bucket. For ringBufferPtr it's ringBufferPtr->zone.
+So, lock order:
+Bucket lock -> ringBufferPtr lock -> zone lock
 
-- Process 1: LOCK HASH_AND_ZONE_EVICTION_LOCK for read
+PRINCIPLE 4: multiple buckets or zones can't be locked at the same time by
+a single process.
+
+
+To fix the lock order, instead of:
+---------------------------------------
+P1: LOCK bucket A
+                       P2: LOCK bucket B
+P1: LOCK RBP
+P1: LOCK zone Y
+    (for eviction)
+                       P2: LOCK zone Y
+P1: LOCK bucket B
+
+
+Use a trylock in the other process:
+---------------------------------------
+P1: LOCK bucket A
+                       P2: LOCK bucket B
+P1: LOCK RBP
+P1: LOCK zone Y
+    (for eviction)
+                       P2: LOCK zone Y
+P1: TRYLOCK bucket B
+    (fail)
+P1: UNLOCK zone Y
+                       (acquired Y)
+P1: LOCK zone Y
+    (for eviction)
+                       P2: UNLOCK zone Y
+                       P2: UNLOCK bucket B
+P1: TRYLOCK bucket B
+    (success)
+P1: UNLOCK bucket B
+P1: UNLOCK zone Y
+P1: UNLOCK RBP
+
+
+To prevent livelock, only one of the processes should use a trylock, and
+the other should be a regular lock. Otherwise you'll have this problem:
+---------------------------------------
+P1: LOCK bucket A
+                       P2: LOCK bucket B
+P1: LOCK RBP
+P1: LOCK zone Y
+    (for eviction)
+                       P2: TRYLOCK zone Y
+                           (fail)
+P1: TRYLOCK bucket B
+    (fail)
+                       P2: UNLOCK bucket B
+                       P2: LOCK bucket B
+P1: UNLOCK zone Y
+P1: LOCK zone Y
+    (for eviction)
+                       P2: TRYLOCK zone Y
+                           (fail)
+P1: TRYLOCK bucket B
+    (fail)
+                       P2: UNLOCK bucket B
+                       P2: LOCK bucket B
+P1: UNLOCK zone Y
+P1: LOCK zone Y
+    (for eviction)
+
+          ...  ad infinitum ...
+
+(You could add random length timeouts between UNLOCK and LOCK, but that's a bit
+hacky.)
+
+Because of this, only the process that is doing the zone eviction should use
+a trylock. Does it cause a livelock if two processes try to run zone eviction
+at the same time?
+---------------------------------------
+P1: LOCK bucket A
+                       P2: LOCK bucket B
+P1: LOCK RBP
+P1: LOCK zone Y
+    (for eviction)
+                       P2: Lock RBP
+                       P2: LOCK zone Y
+                           (for eviction)
+P1: TRYLOCK bucket C
+                       P2: TRYLOCK bucket C
+
+Not a problem, because the ringBufferPtr lock always blocks, and the zone Y
+lock would also block.
+
+PRINCIPLE 5: you can violate PRINCIPLE 3's bucket->zone order, but only if you
+use a trylock, AND all processes must lock (not trylock) some shared lock first
+before the trylock (i.e. the same bucket lock or the same zone lock).
+
+
+##############################################################################
+#               Deadlock and livelock solution brainstorming                 #
+##############################################################################
+
+(Most of this was written before the deadlock problem stuff above.)
+
+
+First idea (lock everything with an additional readers-writer-lock):
+----------
+
+TODO: check if this is correct anymore.
+
+- P1: LOCK HASH_AND_ZONE_EVICTION_LOCK for read
 - P1: LOCK bucket A
-- Process 2: LOCK HASH_AND_ZONE_EVICTION_LOCK for read
+- P2: LOCK HASH_AND_ZONE_EVICTION_LOCK for read
 - P2: LOCK bucket B
 - P1: LOCK zone X
 - P1: new value doesn't fit into existing chunk in zone X
 - P1: free zone X first chunk
-- P1: RELEASE zone X
+- P1: UNLOCK zone X
 - P1: LOCK HASH_AND_ZONE_EVICTION_LOCK for write
-  - Waits until P2 has released its HASH_AND_ZONE_EVICTION_LOCK read lock
+  - Waits until P2 has UNLOCK its HASH_AND_ZONE_EVICTION_LOCK read lock
 - P2: LOCK zone Y
 - P2: read value from zone Y
-- P2: RELEASE zone Y
-- P2: RELEASE bucket B
+- P2: UNLOCK zone Y
+- P2: UNLOCK bucket B
 - P1: unlink entry from bucket A
   - P1: find bucket for entry->hashNext (bucket B)
   - P1: LOCK bucket B
   - P1: update entry->hashNext->hashPrev
-  - P1: RELEASE bucket B
+  - P1: UNLOCK bucket B
 - P1: LOCK oldest zone via ringBufferPtr (zone Y)
 - P1: evict zone Y to make space for new values
   - P1: free zone Y first chunk
   - P1: LOCK bucket A (again; recursive lock makes this OK)
   - P1: unlink entry from bucket A
-  - P1: RELEASE bucket A
+  - P1: UNLOCK bucket A
   - P1: free zone Y second chunk
   - P1: LOCK bucket B
   - P1: unlink entry from bucket B
-  - P1: RELEASE bucket B
+  - P1: UNLOCK bucket B
 - P1: write new value to zone Y
-- P1: RELEASE zone Y
-- P1: RELEASE bucket A
+- P1: UNLOCK zone Y
+- P1: UNLOCK bucket A
 
 (Btw, if our flock() readers-writer-lock implementation is slow, you might try
 to implement your own with sem_*() and shmop_*(), with a counter and
 an "isLocked" variable in shared memory:
 https://en.wikipedia.org/wiki/Readers%E2%80%93writer_lock#Implementation)
 
-Second solution (always acquire zone lock first, then bucket lock):
----------------
+
+Second idea (always acquire zone lock first, then bucket lock):
+-----------
 
 - do you need a new short-duration lock for the whole hash table, for reading the bucket's head entry?
   - released already before we even read the entry's chunk
-  - do we need to lock this for write later, again giving us the problem is lock inversion?
+  - do we need to lock this for write later, again giving us the problem of lock inversion?
+- how do you know which zone to lock before locking and reading the bucket?
+  - if you first lock the bucket, then release it, then lock the zone and the bucket, you probably run into race conditions
 
-Third solution (dirty bit for future removal of chunks, instead of immediate removal):
---------------
+
+Third idea (dirty bit for future removal of chunks, instead of immediate removal):
+----------
 
 A realization: this problem is essentially the same as in garbage collection
 and reference counting.
@@ -928,19 +1091,59 @@ and reference counting.
 https://blogs.msdn.microsoft.com/larryosterman/2005/02/18/concurrency-part-5-what-happens-when-you-cant-avoid-lock-misordering/
 https://en.wikipedia.org/wiki/Reference_counting
 
-we're essentially holding references to our cache item objects, and we can't
+We're essentially holding references to our cache item objects, and we can't
 delete an object before all references to it have been NULLed.
 
-mark a zone chunk as dirty with a dirty-bit, and if another process holds a lock to a reference (i.e. hash table bucket), let the other process delete its reference when it sees the dirty bit? if another process doesn't hold a lock to the reference, the current process can NULL it (although can we acquire a lock with flock()'s LOCK_NB?).
+- Mark a zone chunk as dirty with a dirty-bit, and if another process holds
+  a lock to a reference (i.e. hash table bucket), let the other process
+  delete its reference when it sees the dirty bit? if another process doesn't
+  hold a lock to the bucket, the current process can NULL the hash table
+  reference instead.
+  - You can use LOCK_NB (in a loop, with a timeout), which returns immediately if
+    the lock is already locked by someone else, but acquires the lock if it's not
 
-can we somehow make sure beforehand, that the oldest zone never has any references to it in the hash table, when we're about to evict the zone?
-  the earliest point to do something about this is when we move the ringBufferPtr
-  at that point, set the zone's chunks' dirty-bits to 1
-  at some point of processing, in any process, remove hash table reference and set chunk's hash-table-reference-deleted bit to 1
-    when that item is accessed via get(), set(), delete(), add()...
-    in some daemon-thread-like maintenance function when ShmCache is being destroyed
-  sometimes all chunks won't have had time to get deleted when we already need the zone's space for new values
-    need a way to wait in a process until the zone is fully evicted
-    evict the remaining chunks in this process, and/or wait currently lock-holding processes to finish
+Can we somehow make sure beforehand, that the oldest zone never has any
+references to it in the hash table, when we're about to evict the zone?
+
+- the earliest point to do something about this is when we move the ringBufferPtr
+- at that point, set the zone's chunks' dirty-bits to 1
+- at some point of processing, in any process, remove hash table reference and
+  set chunk's hash-table-reference-deleted bit to 1
+  - when that item is accessed via get(), set(), delete(), add()...
+    - in some daemon-thread-like maintenance function when ShmCache is being destroyed
+  - sometimes all chunks won't have had time to get deleted when we already need the zone's space for new values
+    - need a way to wait in a process until the zone is fully evicted
+    - evict the remaining chunks in this process, and/or wait currently lock-holding processes to finish
+
+When a zone is locked for modification, but the modified chunk's associated
+bucket is not locked, the only allowed modification is marking chunks as dirty
+for later removal.
+
+
+Fourth idea (non-blocking lock request, and pre-emptively releasing a lock):
+-----------
+
+Just use LOCK_NB in the hash table bucket locking, without any dirty-bits.
+Something like:
+
+while true {
+  lock bucket
+  try to lock zone (LOCK_NB)
+  if zone couldn't be locked {
+    unlock bucket
+    continue
+  }
+  break
+}
+
+Is this prone to live-locking?
+
+Is this similar to Memcached's item_trylock?
+
+
+Fifth idea (use a buffer for value writes):
+----------
+
+Copy the value-to-write to some temporary buffer until it can be flushed to a zone.
 
 
