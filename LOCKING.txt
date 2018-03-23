@@ -703,13 +703,13 @@ From https://github.com/memcached/memcached/blob/master/doc/threads.txt:
 
 From thread.c:
 
-		/* item_lock() must be held for an item before any modifications to either its
-		 * associated hash bucket, or the structure itself.
-		 * LRU modifications must hold the item lock, and the LRU lock.
-		 * LRU's accessing items must item_trylock() before modifying an item.
-		 * Items accessible from an LRU must not be freed or modified
-		 * without first locking and removing from the LRU.
-		 */
+    /* item_lock() must be held for an item before any modifications to either its
+     * associated hash bucket, or the structure itself.
+     * LRU modifications must hold the item lock, and the LRU lock.
+     * LRU's accessing items must item_trylock() before modifying an item.
+     * Items accessible from an LRU must not be freed or modified
+     * without first locking and removing from the LRU.
+     */
 
     void item_lock(uint32_t hv) {
         pthread_mutex_lock(&item_locks[hv & hashmask(item_lock_hashpower)]);
