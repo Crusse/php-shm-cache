@@ -1242,10 +1242,52 @@ Copy the value-to-write to some temporary buffer until it can be flushed to a zo
 
 
 ##############################################################################
+#                                  Locks                                     #
+##############################################################################
+
+- Stats lock: locks all access to the stats memory region
+- Bucket lock: locks a hash table bucket, and the hashNext property of all
+  entries in that bucket
+- Zone lock: locks a single zone and all chunks in it
+- Ring buffer pointer lock: locks the ring buffer pointer
+
+
+##############################################################################
+#                               Locking rules                                #
+##############################################################################
+
+Collecting all the mentioned RULEs gives:
+
+RULE 1: to modify anything else than the ok-to-free dirty-bit in a zone chunk,
+        you need to hold the chunk's associated bucket's lock
+
+RULE 2: to modify _anything_ in zones, you need to hold the zone's lock
+
+RULE 3: the lock order between a bucket and a zone lock must always be
+        bucket->zone, not zone->bucket. For ringBufferPtr it's always
+        ringBufferPtr->zone. So, lock order:
+
+        Bucket lock -> ringBufferPtr lock -> zone lock
+
+RULE 4: multiple zones can't be locked at the same time by a single process
+
+RULE 5: bultiple buckets can be locked at the same time, but _only_ by using
+        a trylock when trying to lock the 2nd..Nth bucket (see RULE 6)
+
+RULE 6: you can violate RULE 3's bucket->zone order and acquire a lock in
+        zone->bucket order, but only if you use a trylock, AND all processes
+        must lock (not trylock) either the same bucket lock or the same zone
+        lock first, before the trylock.
+
+
+##############################################################################
 #                             Locking principles                             #
 ##############################################################################
 
-- Use a DAG if you can. It ensures there are no deadlocks.
+Generic stuff I've learned so far:
+
+- Use a DAG (e.g. a singly-linked list) if you can, which makes handling
+  deadlocks a lot easier than more complicated graphs (i.e. ones with cycles)
 - Use lock hierarchies of you can, and only ever traverse the hierarchy in one
   order (e.g. parent->child)
 - Don't keep two locks at the same time, if you can
@@ -1264,5 +1306,7 @@ Copy the value-to-write to some temporary buffer until it can be flushed to a zo
   - Write out the locking order as two columns for two processes/threads
 - When you're designing locks, think of the resources that need to be protected.
   What _is_ a resource? A single "resource" might contain data in multiple places.
+
+
 
 
