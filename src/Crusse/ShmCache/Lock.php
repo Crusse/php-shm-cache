@@ -9,11 +9,12 @@ namespace Crusse\ShmCache;
  */
 class Lock {
 
-  static private $hasReadLock = 0;
-  static private $hasWriteLock = 0;
+  private static $registeredTags = [];
 
-  private $lockFile;
+  private $readLockCount = 0;
+  private $writeLockCount = 0;
   private $tag;
+  private $lockFile;
 
   /**
    * @param string $tag An arbitrary tag for the lock. Only locks with the same tag are synchronized.
@@ -23,7 +24,16 @@ class Lock {
     if ( !is_string( $tag ) )
       throw new \InvalidArgumentException( '$tag is not a string' );
 
+    // $readLockCount and $writeLockCount are instance variables. If we let
+    // multiple Lock instances to use the same tag (and therefore the same
+    // lock), one PHP process can try to acquire a lock that it already has,
+    // ending up deadlocking itself.
+    if ( isset( self::$registeredTags[ $tag ] ) ) {
+      throw new \InvalidArgumentException( 'A '. __CLASS__ .' with the tag "'. $tag .'" has already been instantiated; you can only register the same tag once' );
+    }
+
     $this->tag = $tag;
+
     $this->initLockFiles();
   }
 
@@ -33,103 +43,106 @@ class Lock {
       fclose( $this->lockFile );
   }
 
-  function getWriteLock() {
+  function getWriteLock( $try = false ) {
 
-    if ( self::$hasReadLock ) {
-      trigger_error( 'Tried to acquire write lock even though a read lock is already acquired' );
+    if ( $this->readLockCount ) {
+      trigger_error( 'Tried to acquire "'. $this->tag .'" write lock even though a read lock is already acquired' );
       return false;
     }
 
     // Allow nested write locks
-    if ( self::$hasWriteLock ) {
-      ++self::$hasWriteLock;
+    if ( $this->writeLockCount ) {
+      ++$this->writeLockCount;
       return true;
     }
 
     // This will block until there are no readers and writers with a lock
-    $ret = flock( $this->lockFile, LOCK_EX );
+    $ret = flock( $this->lockFile, LOCK_EX|( $try ? LOCK_NB : 0 ) );
 
     if ( $ret )
-      ++self::$hasWriteLock;
-    else
-      trigger_error( 'Could not acquire exclusive lock' );
+      ++$this->writeLockCount;
+    else if ( !$try )
+      trigger_error( 'Could not acquire exclusive "'. $this->tag .'" lock' );
 
     return $ret;
   }
 
   function releaseWriteLock() {
 
-    if ( self::$hasReadLock ) {
-      trigger_error( 'Tried to release a write lock while having a read lock' );
+    if ( $this->readLockCount ) {
+      trigger_error( 'Tried to release a "'. $this->tag .'" write lock while having a read lock' );
       return false;
     }
 
     // Allow nested write locks
-    if ( self::$hasWriteLock > 1 ) {
-      --self::$hasWriteLock;
+    if ( $this->writeLockCount > 1 ) {
+      --$this->writeLockCount;
       return true;
     }
-    else if ( self::$hasWriteLock <= 0 ) {
-      trigger_error( 'Tried to release non-existent write lock' );
+    else if ( $this->writeLockCount <= 0 ) {
+      trigger_error( 'Tried to release non-existent "'. $this->tag .'" write lock' );
       return false;
     }
 
     $ret = flock( $this->lockFile, LOCK_UN );
 
     if ( $ret )
-      --self::$hasWriteLock;
+      --$this->writeLockCount;
     else
-      trigger_error( 'Could not unlock resource lock file' );
+      trigger_error( 'Could not unlock "'. $this->tag .'" resource lock file' );
 
     return $ret;
   }
 
-  function getReadLock() {
+  function getReadLock( $try = false ) {
 
-    if ( self::$hasWriteLock ) {
-      trigger_error( 'Tried to acquire read lock even though a write lock is already acquired' );
+    if ( $this->writeLockCount ) {
+      trigger_error( 'Tried to acquire "'. $this->tag .'" read lock even though a write lock is already acquired' );
       return false;
     }
 
     // Allow nested read locks
-    if ( self::$hasReadLock ) {
-      ++self::$hasReadLock;
+    if ( $this->readLockCount ) {
+      ++$this->readLockCount;
       return true;
     }
 
-    $ret = flock( $this->lockFile, LOCK_SH );
+    $ret = flock( $this->lockFile, LOCK_SH|( $try ? LOCK_NB : 0 ) );
 
     if ( $ret )
-      ++self::$hasReadLock;
-    else
-      trigger_error( 'Could not acquire read lock' );
+      ++$this->readLockCount;
+    else if ( !$try )
+      trigger_error( 'Could not acquire "'. $this->tag .'" read lock' );
 
     return $ret;
   }
 
   function releaseReadLock() {
 
-    if ( self::$hasWriteLock ) {
-      trigger_error( 'Tried to release a write lock while having a read lock' );
+    if ( $this->writeLockCount ) {
+      trigger_error( 'Tried to release "'. $this->tag .'" write lock while having a read lock' );
       return false;
     }
 
     // Allow nested read locks
-    if ( self::$hasReadLock > 1 ) {
-      --self::$hasReadLock;
+    if ( $this->readLockCount > 1 ) {
+      --$this->readLockCount;
       return true;
     }
-    else if ( self::$hasReadLock <= 0 ) {
-      trigger_error( 'Tried to release non-existent read lock' );
+    else if ( $this->readLockCount <= 0 ) {
+      trigger_error( 'Tried to release non-existent "'. $this->tag .'" read lock' );
       return false;
     }
 
     $ret = flock( $this->lockFile, LOCK_UN );
 
     if ( $ret )
-      --self::$hasReadLock;
+      --$this->readLockCount;
     else
-      trigger_error( 'Could not unlock resource lock file' );
+      trigger_error( 'Could not unlock "'. $this->tag .'" resource lock file' );
+
+    // TODO: do performance requirements allow us to fclose() here? Wouldn't
+    // hit max open files limits so easily...
 
     return $ret;
   }

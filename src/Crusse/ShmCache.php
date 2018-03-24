@@ -8,13 +8,12 @@ namespace Crusse;
  * 
  * Features:
  * 
- * - FIFO queue: oldest element is evicted first when the cache is full
- * - Uses a hash table (with linear probing) for accessing items quickly
  * - Stores the hash table and items' values in Unix shared memory
+ * - FIFO queue: tries to evict the oldest items when the cache is full
  *
  * The same memory block is shared by all instances of ShmCache. This means the
- * maximum amount of memory used by ShmCache is always DEFAULT_CACHE_SIZE (or
- * $desiredSize, if defined).
+ * maximum amount of memory used by ShmCache is always DEFAULT_CACHE_SIZE, or
+ * $desiredSize, if defined.
  *
  * You can use the Unix programs `ipcs` and `ipcrm` to list and remove the
  * memory block created by this class, if something goes wrong.
@@ -23,7 +22,7 @@ namespace Crusse;
  * class are with the same Unix user (e.g. 'www-data'), because the shared
  * memory block cannot be deleted (e.g. in destroy()) by another user, at least
  * on Linux. If you have problems deleting the memory block created by this
- * class, using `ipcrm` as root is your best bet.
+ * class via $cache->destroy(), using `ipcrm` as root is your best bet.
  *
  *
  * Memory block structure
@@ -64,25 +63,18 @@ namespace Crusse;
  */
 class ShmCache {
 
-  // Total amount of space to allocate for the shared memory block. This will
-  // contain both the keys area and the values area, so the amount allocatable
-  // for values will be slightly smaller.
-  const DEFAULT_CACHE_SIZE = 134217728;
-  const SAFE_AREA_SIZE = 64;
   // Don't let value allocations become smaller than this, to reduce fragmentation
-  const MIN_VALUE_ALLOC_SIZE = 64;
+  const MIN_VALUE_ALLOC_SIZE = 32;
   const MAX_VALUE_SIZE = 2097152; // 2 MiB
-  const FULL_CACHE_REMOVED_ITEMS = 10;
-  // Use a low load factor (i.e. make there be many more slots in the hash
-  // table than the maximum amount of items we'll be storing). 0.5 or less.
-  const MAX_LOAD_FACTOR = 0.5;
   // If a key string is longer than this, the key is truncated silently
   const MAX_KEY_LENGTH = 250;
+  // The more hash table buckets there are, the more memory is used but the
+  // faster it is to find a hash table entry. This also affects how many locks
+  // there are for hash table entries.
+  const HASH_BUCKET_COUNT = 512;
 
   const FLAG_SERIALIZED = 0b00000001;
 
-  private $shm;
-  private $shmKey;
   // TODO: currently we're locking the whole memory block whenever there's
   // a read or a write. We should probably add multiple locks to only lock a portion
   // of the memory block. Maybe have separate locks for these (but be careful
@@ -91,11 +83,14 @@ class ShmCache {
   // [
   //   [itemcount]
   //   [ringbufferpointer]
-  //   [gethits and getmisses]
   // ]
+  // [gethits and getmisses]
   // [A fixed number of slices of the keys area?]
   // [A fixed number of slices of the values area? How to align locks at value boundaries?]
-  private $lock;
+  private $memAllocLock;
+  private $statsLock;
+  private $bucketLocks = [];
+
   private $getHits = 0;
   private $getMisses = 0;
 
@@ -114,9 +109,10 @@ class ShmCache {
         round( $desiredSize / 1024 / 1024, 5 ) .' MiB' );
     }
 
-    $this->lock = new ShmCache\Lock( 'shmcache' );
+    $this->memAllocLock = new ShmCache\Lock( 'memalloc' );
+    $this->statsLock = new ShmCache\Lock( 'stats' );
 
-    $this->initMemBlock( $desiredSize );
+    $memBlock = new ShmCache\MemoryBlock( $desiredSize, self::HASH_BUCKET_COUNT );
   }
 
   function __destruct() {
@@ -130,14 +126,19 @@ class ShmCache {
   function set( $key, $value ) {
 
     if ( !$this->shm )
-      throw new \Exception( 'Tried to use a destroyed cache. Please create a new instance of '. __CLASS__ );
+      throw new \Exception( 'Tried to use a destroyed cache. Please create a new instance of '. __CLASS__ .'.' );
 
     $key = $this->sanitizeKey( $key );
     $value = $this->maybeSerialize( $value, $retIsSerialized );
 
-    $this->lock->getWriteLock();
+    $this->memAllocLock->getReadLock();
+
+    $lock = $this->getItemLock( $key );
+    $lock->getWriteLock();
     $ret = $this->_set( $key, $value, $retIsSerialized );
-    $this->lock->releaseWriteLock();
+    $lock->releaseLock();
+
+    $this->memAllocLock->releaseLock();
 
     return $ret;
   }
@@ -145,13 +146,18 @@ class ShmCache {
   function get( $key ) {
 
     if ( !$this->shm )
-      throw new \Exception( 'Tried to use a destroyed cache. Please create a new instance of '. __CLASS__ );
+      throw new \Exception( 'Tried to use a destroyed cache. Please create a new instance of '. __CLASS__ .'.' );
 
     $key = $this->sanitizeKey( $key );
 
-    $this->lock->getReadLock();
+    $this->memAllocLock->getReadLock();
+
+    $lock = $this->getItemLock( $key );
+    $lock->getReadLock();
     $ret = $this->_get( $key, $retIsSerialized, $retIsCacheHit );
-    $this->lock->releaseReadLock();
+    $lock->releaseLock();
+
+    $this->memAllocLock->releaseLock();
 
     if ( $ret && $retIsSerialized )
       $ret = unserialize( $ret );
@@ -167,13 +173,18 @@ class ShmCache {
   function exists( $key ) {
 
     if ( !$this->shm )
-      throw new \Exception( 'Tried to use a destroyed cache. Please create a new instance of '. __CLASS__ );
+      throw new \Exception( 'Tried to use a destroyed cache. Please create a new instance of '. __CLASS__ .'.' );
 
     $key = $this->sanitizeKey( $key );
 
-    $this->lock->getReadLock();
+    $this->memAllocLock->getReadLock();
+
+    $lock = $this->getItemLock( $key );
+    $lock->getReadLock();
     $ret = ( $this->getHashTableIndex( $key ) > -1 );
-    $this->lock->releaseReadLock();
+    $lock->releaseLock();
+
+    $this->memAllocLock->releaseLock();
 
     return $ret;
   }
@@ -181,19 +192,24 @@ class ShmCache {
   function add( $key, $value ) {
 
     if ( !$this->shm )
-      throw new \Exception( 'Tried to use a destroyed cache. Please create a new instance of '. __CLASS__ );
+      throw new \Exception( 'Tried to use a destroyed cache. Please create a new instance of '. __CLASS__ .'.' );
 
     $key = $this->sanitizeKey( $key );
     $value = $this->maybeSerialize( $value, $retIsSerialized );
 
-    $this->lock->getWriteLock();
+    $this->memAllocLock->getReadLock();
+
+    $lock = $this->getItemLock( $key );
+    $lock->getWriteLock();
 
     if ( $this->getHashTableIndex( $key ) > -1 )
       $ret = false;
     else
       $ret = $this->_set( $key, $value, $retIsSerialized );
 
-    $this->lock->releaseWriteLock();
+    $lock->releaseLock();
+
+    $this->memAllocLock->releaseLock();
 
     return $ret;
   }
@@ -201,19 +217,24 @@ class ShmCache {
   function replace( $key, $value ) {
 
     if ( !$this->shm )
-      throw new \Exception( 'Tried to use a destroyed cache. Please create a new instance of '. __CLASS__ );
+      throw new \Exception( 'Tried to use a destroyed cache. Please create a new instance of '. __CLASS__ .'.' );
 
     $key = $this->sanitizeKey( $key );
     $value = $this->maybeSerialize( $value, $retIsSerialized );
 
-    $this->lock->getWriteLock();
+    $this->memAllocLock->getReadLock();
+
+    $lock = $this->getItemLock( $key );
+    $lock->getWriteLock();
 
     if ( $this->getHashTableIndex( $key ) < 0 )
       $ret = false;
     else
       $ret = $this->_set( $key, $value, $retIsSerialized );
 
-    $this->lock->releaseWriteLock();
+    $lock->releaseLock();
+
+    $this->memAllocLock->releaseLock();
 
     return $ret;
   }
@@ -221,13 +242,17 @@ class ShmCache {
   function increment( $key, $offset = 1, $initialValue = 0 ) {
 
     if ( !$this->shm )
-      throw new \Exception( 'Tried to use a destroyed cache. Please create a new instance of '. __CLASS__ );
+      throw new \Exception( 'Tried to use a destroyed cache. Please create a new instance of '. __CLASS__ .'.' );
 
     $key = $this->sanitizeKey( $key );
     $offset = (int) $offset;
     $initialValue = (int) $initialValue;
 
-    if ( !$this->lock->getWriteLock() )
+    if ( !$this->memAllocLock->getReadLock() )
+      return false;
+
+    $lock = $this->getItemLock( $key );
+    if ( !$lock->getWriteLock() )
       return false;
 
     $value = $this->_get( $key, $retIsSerialized, $retIsCacheHit );
@@ -239,7 +264,7 @@ class ShmCache {
     }
     else if ( !is_numeric( $value ) ) {
       trigger_error( 'Item '. $key .' is not numeric' );
-      $this->lock->releaseWriteLock();
+      $lock->releaseLock();
       return false;
     }
 
@@ -247,8 +272,9 @@ class ShmCache {
     $valueSerialized = $this->maybeSerialize( $value, $retIsSerialized );
     $success = $this->_set( $key, $valueSerialized, $retIsSerialized );
 
-    if ( !$this->lock->releaseWriteLock() )
-      return false;
+    $lock->releaseLock();
+
+    $this->memAllocLock->releaseLock();
 
     if ( $success )
       return $value;
@@ -267,11 +293,15 @@ class ShmCache {
   function delete( $key ) {
 
     if ( !$this->shm )
-      throw new \Exception( 'Tried to use a destroyed cache. Please create a new instance of '. __CLASS__ );
+      throw new \Exception( 'Tried to use a destroyed cache. Please create a new instance of '. __CLASS__ .'.' );
 
     $key = $this->sanitizeKey( $key );
 
-    if ( !$this->lock->getWriteLock() )
+    if ( !$this->memAllocLock->getReadLock() )
+      return false;
+
+    $lock = $this->getItemLock( $key );
+    if ( !$lock->getWriteLock() )
       return false;
 
     $index = $this->getHashTableIndex( $key );
@@ -294,8 +324,9 @@ class ShmCache {
       }
     }
 
-    if ( !$this->lock->releaseWriteLock() )
-      return false;
+    $lock->releaseLock();
+
+    $this->memAllocLock->releaseLock();
 
     return $ret;
   }
@@ -303,9 +334,9 @@ class ShmCache {
   function flush() {
 
     if ( !$this->shm )
-      throw new \Exception( 'Tried to use a destroyed cache. Please create a new instance of '. __CLASS__ );
+      throw new \Exception( 'Tried to use a destroyed cache. Please create a new instance of '. __CLASS__ .'.' );
 
-    if ( !$this->lock->getWriteLock() )
+    if ( !$this->memAllocLock->getWriteLock() )
       return false;
 
     try {
@@ -317,23 +348,22 @@ class ShmCache {
       $ret = false;
     }
 
-    if ( !$this->lock->releaseWriteLock() )
-      return false;
+    $this->memAllocLock->releaseLock();
 
     return $ret;
   }
 
   /**
    * Deletes the shared memory block created by this class. This will only
-   * work if the block was created by the same user or group that is currently
-   * running this PHP script.
+   * work if the block was created by the same Unix user or group that is
+   * currently running this PHP script.
    */
   function destroy() {
 
     if ( !$this->shm )
-      throw new \Exception( 'Tried to use a destroyed cache. Please create a new instance of '. __CLASS__ );
+      throw new \Exception( 'Tried to use a destroyed cache. Please create a new instance of '. __CLASS__ .'.' );
 
-    if ( !$this->lock->getWriteLock() )
+    if ( !$this->memAllocLock->getWriteLock() )
       return false;
 
     try {
@@ -345,15 +375,14 @@ class ShmCache {
       $ret = false;
     }
 
-    if ( !$this->lock->releaseWriteLock() )
-      return false;
+    $this->memAllocLock->releaseLock();
 
     return $ret;
   }
 
   function getStats() {
 
-    if ( !$this->lock->getReadLock() )
+    if ( !$this->memAllocLock->getReadLock() )
       throw new \Exception( 'Could not get a lock' );
 
     $ret = (object) [
@@ -375,6 +404,7 @@ class ShmCache {
     ];
 
     for ( $i = $this->KEYS_START; $i < $this->KEYS_START + $this->KEYS_SIZE; $i += $this->LONG_SIZE ) {
+      // TODO: acquire item lock?
       if ( unpack( 'l', shmop_read( $this->shm, $i, $this->LONG_SIZE ) )[ 1 ] !== 0 )
         ++$ret->usedHashTableSlots;
     }
@@ -383,6 +413,7 @@ class ShmCache {
 
     for ( $i = $this->VALUES_START; $i < $this->VALUES_START + $this->VALUES_SIZE; ) {
 
+      // TODO: acquire item lock?
       $item = $this->getItemMetaByOffset( $i );
 
       if ( $item[ 'valsize' ] ) {
@@ -393,7 +424,7 @@ class ShmCache {
       $i += $this->ITEM_META_SIZE + $item[ 'valallocsize' ];
     }
 
-    if ( !$this->lock->releaseReadLock() )
+    if ( !$this->memAllocLock->releaseLock() )
       throw new \Exception( 'Could not release a lock' );
 
     $ret->avgItemValueSize = ( $ret->items )
@@ -403,58 +434,15 @@ class ShmCache {
     return $ret;
   }
 
-  function dumpHashTableClusters() {
+  private function getItemLock( $key ) {
 
-    if ( !$this->lock->getReadLock() )
-      throw new \Exception( 'Could not get a lock' );
+    $baseIndex = $this->getHashTableBaseIndex( $key );
+    $lockIndex = $baseIndex % self::HASH_BUCKET_COUNT;
 
-    for ( $i = $this->KEYS_START; $i < $this->KEYS_START + $this->KEYS_SIZE; $i += $this->LONG_SIZE ) {
-      if ( unpack( 'l', shmop_read( $this->shm, $i, $this->LONG_SIZE ) )[ 1 ] !== 0 )
-        echo 'x';
-      else
-        echo '.';
-    }
+    if ( !isset( $this->bucketLocks[ $lockIndex ] ) )
+      $this->bucketLocks[ $lockIndex ] = new ShmCache\Lock( 'item'. $lockIndex );
 
-    if ( !$this->lock->releaseReadLock() )
-      throw new \Exception( 'Could not release a lock' );
-
-    echo PHP_EOL;
-  }
-
-  function dumpItems() {
-
-    if ( !$this->lock->getReadLock() )
-      throw new \Exception( 'Could not get a lock' );
-
-    echo 'Items in cache: '. $this->getItemCount() . PHP_EOL;
-
-    $itemNr = 1;
-    $nonFreeItems = 0;
-
-    for ( $i = $this->VALUES_START; $i < $this->VALUES_START + $this->VALUES_SIZE; ) {
-
-      $item = $this->getItemMetaByOffset( $i );
-
-      echo '['. $itemNr++ .'] '. ( !$item[ 'valsize' ] ? '[None]' : $item[ 'key' ] ) .
-        ' (hashidx: '. ( !$item[ 'valsize' ] ? '[None]' : $this->getHashTableIndex( $item[ 'key' ] ) ) .
-        ', offset: '. $i .', nextoffset: '. $this->getNextItemOffset( $i, $item[ 'valallocsize' ] ) .
-        ', valallocsize: '. $item[ 'valallocsize' ] .', valsize: '. $item[ 'valsize' ] .')'. PHP_EOL;
-
-      if ( !$item[ 'valsize' ] ) {
-        echo '    [Free space]';
-      }
-      else {
-        echo '    "'. shmop_read( $this->shm, $i + $this->ITEM_META_SIZE, min( 60, $item[ 'valsize' ] ) ) .'"';
-        ++$nonFreeItems;
-      }
-
-      echo PHP_EOL;
-
-      $i += $this->ITEM_META_SIZE + $item[ 'valallocsize' ];
-    }
-
-    if ( !$this->lock->releaseReadLock() )
-      throw new \Exception( 'Could not release a lock' );
+    return $this->bucketLocks[ $lockIndex ];
   }
 
   private function maybeSerialize( $value, &$retIsSerialized ) {
@@ -520,6 +508,7 @@ class ShmCache {
           // There's enough space for the new value in the existing item's value
           // memory area spot. Replace the value in-place.
           if ( $newValueSize <= $existingItem[ 'valallocsize' ] ) {
+
             $flags = 0;
             if ( $valueIsSerialized )
               $flags |= self::FLAG_SERIALIZED;
@@ -527,6 +516,7 @@ class ShmCache {
               goto error;
             if ( !$this->writeItemValue( $metaOffset + $this->ITEM_META_SIZE, $value ) )
               goto error;
+
             goto success;
           }
           // The new value is too large to fit into the existing item's spot, and
@@ -546,13 +536,16 @@ class ShmCache {
     unset( $index );
 
     // Note: whenever we cannot store the value to the cache, we remove any
-    // existing item with the same key. This emulates memcached:
+    // existing item with the same key (in removeItem() above). This emulates memcached:
     // https://github.com/memcached/memcached/wiki/Performance#how-it-handles-set-failures
     if ( $newValueSize > self::MAX_VALUE_SIZE ) {
       trigger_error( 'Item "'. rawurlencode( $key ) .'" is too large ('. round( $newValueSize / 1000, 2 ) .' KB) to cache' );
       goto error;
     }
 
+    $itemsToRemove = self::FULL_CACHE_REMOVED_ITEMS;
+
+    // TODO: metadata lock
     $oldestItemOffset = $this->getRingBufferPointer();
     if ( $oldestItemOffset <= 0 )
       goto error;
@@ -560,10 +553,10 @@ class ShmCache {
     if ( !$replacedItem )
       goto error;
     $replacedItemOffset = $oldestItemOffset;
-    $replacedItemIsFree = !$replacedItem[ 'valsize' ];
-    if ( !$replacedItemIsFree ) {
+    if ( $replacedItem[ 'valsize' ] ) {
       if ( !$this->removeItem( $replacedItem[ 'key' ], $replacedItemOffset ) )
         goto error;
+      --$itemsToRemove;
     }
 
     $allocatedSize = $replacedItem[ 'valallocsize' ];
@@ -574,13 +567,6 @@ class ShmCache {
     // but multiple at once, so that any calls to set() afterwards will not
     // immediately have to remove an item again.
     if ( $this->getItemCount() >= $this->MAX_ITEMS ) {
-
-      $itemsToRemove = self::FULL_CACHE_REMOVED_ITEMS;
-
-      // $replacedItem is the oldest item in the buffer, and was already
-      // removed above
-      if ( !$replacedItemIsFree )
-        --$itemsToRemove;
 
       $allocatedSize = $this->mergeItemWithNextFreeValueSlots( $replacedItemOffset );
       $removedOffset = $this->getNextItemOffset( $replacedItemOffset, $allocatedSize );
@@ -632,13 +618,6 @@ class ShmCache {
       // Loop around if we reached the end of the values area
       if ( !$nextItemOffset ) {
 
-        // We'll free the old item at the end of the values area, as we don't
-        // wrap items around. Each item is a contiguous run of memory.
-        if ( !$replacedItemIsFree ) {
-          if ( !$this->removeItem( $key, $replacedItemOffset ) )
-            goto error;
-        }
-
         // Free the first item
         $firstItem = $this->getItemMetaByOffset( $this->VALUES_START );
         if ( !$firstItem )
@@ -648,7 +627,6 @@ class ShmCache {
             goto error;
         }
         $replacedItemOffset = $this->VALUES_START;
-        $replacedItemIsFree = true;
         $allocatedSize = $firstItem[ 'valallocsize' ];
         $nextItemOffset = $this->getNextItemOffset( $this->VALUES_START, $allocatedSize );
 
@@ -794,6 +772,7 @@ class ShmCache {
     $hash = hash( 'crc32', $key, true );
 
     // Read as a 32-bit unsigned long
+    // TODO: unpack() is slow. Is there an alternative?
     $index = unpack( 'L', $hash )[ 1 ];
     // Modulo by the amount of hash table slots to get an array index
     $index %= $this->KEYS_SLOTS;
@@ -1044,20 +1023,18 @@ class ShmCache {
     if ( !isset( $unpackFormatWithKey ) )
       $unpackFormatWithKey = 'A'. self::MAX_KEY_LENGTH .'key/lvalallocsize/lvalsize/cflags';
 
-    $readOffset = $offset;
-
     if ( $withKey ) {
       $unpackFormat = $unpackFormatWithKey;
     }
     else {
       $unpackFormat = $unpackFormatNoKey;
-      $readOffset += self::MAX_KEY_LENGTH;
+      $offset += self::MAX_KEY_LENGTH;
     }
 
-    $data = shmop_read( $this->shm, $readOffset, $this->ITEM_META_SIZE );
+    $data = shmop_read( $this->shm, $offset, $this->ITEM_META_SIZE );
 
     if ( $data === false ) {
-      trigger_error( 'Could not read item metadata at offset '. $offset .' (started reading at '. $readOffset .')' );
+      trigger_error( 'Could not read item metadata at offset '. $offset );
       return null;
     }
 
@@ -1129,252 +1106,28 @@ class ShmCache {
     return true;
   }
 
-  private function initMemBlock( $desiredSize ) {
-
-    if ( !$this->lock->getReadLock() )
-      throw new \Exception( 'Could not get a lock' );
-
-    $opened = $this->openMemBlock();
-
-    // Try to re-create an existing block with a larger size, if the block is
-    // smaller than the desired size. This fails (at least on Linux) if the
-    // Unix user trying to delete the block is different than the user that
-    // created the block.
-    if ( $opened && $desiredSize ) {
-
-      $currentSize = shmop_size( $this->shm );
-
-      if ( !$this->lock->releaseReadLock() )
-        throw new \Exception( 'Could not release a lock' );
-
-      if ( $currentSize < $desiredSize ) {
-
-        if ( !$this->lock->getWriteLock() )
-          throw new \Exception( 'Could not get a lock' );
-
-        // Destroy and recreate the memory block with a larger size
-        if ( shmop_delete( $this->shm ) ) {
-          shmop_close( $this->shm );
-          $this->shm = null;
-          $opened = false;
-        }
-        else {
-          trigger_error( 'Could not delete the memory block. Falling back to using the existing, smaller-than-desired block.' );
-        }
-
-        if ( !$this->lock->releaseWriteLock() )
-          throw new \Exception( 'Could not release a lock' );
-      }
-    }
-    else {
-
-      if ( !$this->lock->releaseReadLock() )
-        throw new \Exception( 'Could not release a lock' );
-    }
-
-    // No existing memory block. Create a new one.
-    if ( !$opened ) {
-      if ( !$this->lock->getWriteLock() )
-        throw new \Exception( 'Could not get a lock' );
-
-      $this->createMemBlock( $desiredSize );
-    }
-    else {
-      if ( !$this->lock->getReadLock() )
-        throw new \Exception( 'Could not get a lock' );
-    }
-
-    $this->populateSizes();
-
-    // A new memory block. Write initial values.
-    if ( !$opened ) {
-      $this->clearMemBlock();
-
-      if ( !$this->lock->releaseWriteLock() )
-        throw new \Exception( 'Could not release a lock' );
-    }
-    else {
-      if ( !$this->lock->releaseReadLock() )
-        throw new \Exception( 'Could not release a lock' );
-    }
-
-    return (bool) $this->shm;
-  }
-
-  private function getMemBlockKey() {
-
-    if ( $this->shmKey )
-      return $this->shmKey;
-
-    $tmpFile = '/var/lock/php-shm-cache-87b1dcf602a-memory.lock';
-    if ( !file_exists( $tmpFile ) ) {
-      if ( !touch( $tmpFile ) )
-        throw new \Exception( 'Could not create '. $tmpFile );
-      if ( !chmod( $tmpFile, 0777 ) )
-        throw new \Exception( 'Could not change permissions of '. $tmpFile );
-    }
-
-    $this->shmKey = fileinode( $tmpFile );
-    if ( !$this->shmKey )
-      throw new \InvalidArgumentException( 'Invalid shared memory block key' );
-
-    return $this->shmKey;
-  }
-
-  /**
-   * @throws \Exception If both opening and creating a memory block failed
-   * @return bool True if an existing block was opened, false if a new block was created
-   */
-  private function openMemBlock() {
-
-    $blockKey = $this->getMemBlockKey();
-    $mode = 0777;
-
-    // The 'size' parameter is ignored by PHP when 'w' is used:
-    // https://github.com/php/php-src/blob/9e709e2fa02b85d0d10c864d6c996e3368e977ce/ext/shmop/shmop.c#L183
-    $this->shm = @shmop_open( $blockKey, "w", $mode, 0 );
-
-    return (bool) $this->shm;
-  }
-
-  private function createMemBlock( $desiredSize ) {
-
-    $blockKey = $this->getMemBlockKey();
-    $mode = 0777;
-    $this->shm = shmop_open( $blockKey, "n", $mode, ( $desiredSize ) ? $desiredSize : self::DEFAULT_CACHE_SIZE );
-
-    return (bool) $this->shm;
-  }
-
-  private function populateSizes() {
-
-    $primes = [
-      5003,
-      10007,
-      20011,
-      30011,
-      40009,
-      50021,
-      75013,
-      100012,
-      125017,
-      150011,
-      200009,
-      250013,
-      300017,
-    ];
-
-    $this->BLOCK_SIZE = shmop_size( $this->shm );
-
-    $this->LONG_SIZE = strlen( pack( 'l', 1 ) ); // i.e. sizeof(long) in C
-    $this->CHAR_SIZE = strlen( pack( 'c', 1 ) ); // i.e. sizeof(char) in C
-
-    $keySize = self::MAX_KEY_LENGTH;
-    $allocatedSize = $this->LONG_SIZE;
-    $valueSize = $this->LONG_SIZE;
-    $flagsSize = $this->CHAR_SIZE;
-    $this->ITEM_META_SIZE = $keySize + $allocatedSize + $valueSize + $flagsSize;
-
-    // Metadata area
-
-    $itemCountSize = $this->LONG_SIZE;
-    $ringBufferPtrSize = $this->LONG_SIZE;
-    $getHitsSize = $this->LONG_SIZE;
-    $getMissesSize = $this->LONG_SIZE;
-    $this->METADATA_AREA_START = 0;
-    $this->METADATA_AREA_SIZE = $itemCountSize + $ringBufferPtrSize + $getHitsSize + $getMissesSize;
-
-    // Keys area (i.e. cache keys hash table)
-
-    $approxValuesAreaSize = $this->BLOCK_SIZE - 100000 * $this->LONG_SIZE;
-    $approxBytesPerValuesAreaItem = $this->ITEM_META_SIZE + min( 1024, self::MAX_VALUE_SIZE );
-
-    $this->MAX_ITEMS = floor( $approxValuesAreaSize / $approxBytesPerValuesAreaItem );
-    $hashTableSlotCount = ceil( $this->MAX_ITEMS / self::MAX_LOAD_FACTOR );
-
-    foreach ( $primes as $prime ) {
-      if ( $prime >= $hashTableSlotCount ) {
-        $hashTableSlotCount = $prime;
-        break;
-      }
-    }
-
-    $this->KEYS_SLOTS = $hashTableSlotCount;
-    $this->KEYS_START = $this->METADATA_AREA_START + $this->METADATA_AREA_SIZE + self::SAFE_AREA_SIZE;
-    // The hash table values are "pointers", i.e. offsets to the values area
-    $this->KEYS_SIZE = $this->KEYS_SLOTS * $this->LONG_SIZE;
-
-    // Values area (i.e. item metadata and the actual cached values)
-
-    $this->VALUES_START = $this->KEYS_START + $this->KEYS_SIZE + self::SAFE_AREA_SIZE;
-    $this->VALUES_SIZE = $this->BLOCK_SIZE - $this->VALUES_START;
-    $this->LAST_ITEM_MAX_OFFSET = $this->VALUES_START + $this->VALUES_SIZE -
-      $this->ITEM_META_SIZE - self::MIN_VALUE_ALLOC_SIZE;
-  }
-
-  private function destroyMemBlock() {
-
-    $this->flushBufferedStatsToShm();
-
-    $deleted = shmop_delete( $this->shm );
-
-    if ( !$deleted ) {
-      throw new \Exception( 'Could not destroy the memory block. Try running the \'ipcrm\' command as a super-user to remove the memory block listed in the output of \'ipcs\'.' );
-    }
-
-    shmop_close( $this->shm );
-    $this->shm = null;
-  }
-
   private function flushBufferedStatsToShm() {
 
     // Flush all of our get() hit and miss counts to the shared memory
     try {
-      if ( $this->lock->getWriteLock() ) {
+      if ( $this->statsLock->getWriteLock() ) {
 
-        if ( $this->getHits )
+        if ( $this->getHits ) {
           $this->setGetHits( $this->getGetHits() + $this->getHits );
+          $this->getHits = 0;
+        }
 
-        if ( $this->getMisses )
+        if ( $this->getMisses ) {
           $this->setGetMisses( $this->getGetMisses() + $this->getMisses );
+          $this->getMisses = 0;
+        }
 
-        $this->lock->releaseWriteLock();
+        $this->statsLock->releaseLock();
       }
     }
     catch ( \Exception $e ) {
       trigger_error( $e->getMessage() );
     }
-  }
-
-  /**
-   * Write NULs over the whole block and initialize it with a single, free
-   * cache item.
-   */
-  private function clearMemBlock() {
-
-    // Clear all bytes in the shared memory block
-    $memoryWriteChunk = 1024 * 1024 * 4;
-    for ( $i = 0; $i < $this->BLOCK_SIZE; $i += $memoryWriteChunk ) {
-
-      // Last chunk might have to be smaller
-      if ( $i + $memoryWriteChunk > $this->BLOCK_SIZE )
-        $memoryWriteChunk = $this->BLOCK_SIZE - $i;
-
-      $data = pack( 'x'. $memoryWriteChunk );
-      $res = shmop_write( $this->shm, $data, $i );
-
-      if ( $res === false )
-        throw new \Exception( 'Could not write NUL bytes to the memory block' );
-    }
-
-    // The ring buffer pointer always points to the oldest cache item. In this
-    // case it's the first and only cache item, which represents free space.
-    $this->setRingBufferPointer( $this->VALUES_START );
-    $this->setItemCount( 0 );
-    $this->setGetHits( 0 );
-    $this->setGetMisses( 0 );
-    // Initialize first cache item (i.e. free space)
-    $this->writeItemMeta( $this->VALUES_START, '', $this->VALUES_SIZE - $this->ITEM_META_SIZE, 0, 0 );
   }
 }
 

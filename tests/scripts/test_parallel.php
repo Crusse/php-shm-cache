@@ -12,9 +12,8 @@ error_reporting(E_ALL);
 
 $cache = new Crusse\ShmCache();
 $itemsToCreate = 50000;
-$start = time();
 
-echo 'Creating random object...'. PHP_EOL;
+echo 'Creating random object... ';
 
 $randObj = new stdClass;
 for ( $i = 0; $i < 20; ++$i ) {
@@ -24,7 +23,9 @@ for ( $i = 0; $i < 20; ++$i ) {
   $randObj->$key = [ str_repeat( $key, 50 ) ];
 }
 
-echo 'Setting and getting '. $itemsToCreate .' cache items...'. PHP_EOL;
+echo 'done'. PHP_EOL;
+echo 'Setting and getting '. $itemsToCreate .' cache items... ';
+$start = microtime( true );
 
 for ( $i = 0; $i < $itemsToCreate; ++$i ) {
 
@@ -40,4 +41,4 @@ for ( $i = 0; $i < $itemsToCreate; ++$i ) {
   $cache->get( 'foobar'. $i, $value );
 }
 
-echo 'Done after '. ( time() - $start ) .' seconds'. PHP_EOL;
+echo 'done after '. ( microtime( true ) - $start ) .' seconds'. PHP_EOL;
