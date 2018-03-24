@@ -385,7 +385,7 @@ The problem occurs if those steps are run in this order:
 - A: Read valAddr from hash table entry
 - B: Set hash table entry valAddr to NULL
 - B: Update size from 456 to 0
-- A: Update size from 123 to 456
+- A: Update size from 0 to 123
 
 The hash table thinks the cache item is removed, but the value memory doesn't.
 
@@ -850,9 +850,9 @@ a new value, and the existing chunk doesn't have enough space for it:
 - Race condition?
   - No, because we only use entry->hashNext after unlocking, and the chunk at
     entry->hashNext is never moved or removed while bucket A is locked
-  - PRINCIPLE 1: to modify anything else than the ok-to-free dirty-bit in
+  - RULE 1: to modify anything else than the ok-to-free dirty-bit in
     a zone chunk, you need to hold the bucket lock
-  - PRINCIPLE 2: to modify _anything_ in zones, you need to hold the zone's lock
+  - RULE 2: to modify _anything_ in zones, you need to hold the zone's lock
 - Lock zone Y (oldest zone at ring buffer pointer)
 - Remove all items in zone Y
   - If we naively lock each item's associated bucket here, we deadlock. See
@@ -861,7 +861,7 @@ a new value, and the existing chunk doesn't have enough space for it:
 
 
 ##############################################################################
-#                    Deadlock (between a zone and a bucket)                  #
+#                    Deadlock: bucket->zone vs zone->bucket                  #
 ##############################################################################
 
 Hash table        _A__ _B__
@@ -896,7 +896,7 @@ read an existing item.
   - P1: LOCK zone for entry->hashNext (zone Y)
   - P1: set bucket A head to be entry->hashNext->hashNext
     - No race condition: zone Y's chunk at entry->hashNext->hashNext can't have
-      moved or been removed after unlocking X, as we still have lock A (PRINCIPLE 1)
+      moved or been removed after unlocking X, as we still have lock A (see RULE 1)
   - P1: UNLOCK zone Y
 - P1: LOCK ringBufferPtr (for oldest zone eviction)
 4 P1: LOCK zone Y (oldest zone via ringBufferPtr)
@@ -918,21 +918,23 @@ read an existing item.
 - P1: UNLOCK ringBufferPtr
 - P1: UNLOCK bucket A
 - P2: read second chunk of zone Y
-  - RACE CONDITION due to P1 having removed all chunks, although this is fixed
-    when the DEADLOCK is fixed; see "trylock" below
+  - RACE CONDITION due to P1 having freed all chunks; see "RACE CONDITION" below
+  - However, this is also fixed when the DEADLOCK is fixed; see "TRYLOCK" below
 - P2: UNLOCK zone Y
 - P2: UNLOCK bucket B
 
-PRINCIPLE 3: the lock order between a bucket and a zone lock must always be
+RULE 3: the lock order between a bucket and a zone lock must always be
 bucket->zone, not zone->bucket. For ringBufferPtr it's ringBufferPtr->zone.
 So, lock order:
 Bucket lock -> ringBufferPtr lock -> zone lock
 
-PRINCIPLE 4: multiple buckets or zones can't be locked at the same time by
-a single process.
+RULE 4: multiple zones can't be locked at the same time by a single process.
+
+RULE 5: bultiple buckets can be locked at the same time, but _only_ by using
+a trylock when trying to lock the 2nd..Nth bucket (see RULE 6).
 
 
-To fix the lock order, instead of:
+To fix the DEADLOCK, instead of:
 ---------------------------------------
 P1: LOCK bucket A
                        P2: LOCK bucket B
@@ -943,7 +945,7 @@ P1: LOCK zone Y
 P1: LOCK bucket B
 
 
-Use a trylock in the other process:
+Use a TRYLOCK in the other process:
 ---------------------------------------
 P1: LOCK bucket A
                        P2: LOCK bucket B
@@ -998,6 +1000,7 @@ P1: LOCK zone Y
 (You could add random length timeouts between UNLOCK and LOCK, but that's a bit
 hacky.)
 
+
 Because of this, only the process that is doing the zone eviction should use
 a trylock. Does it cause a livelock if two processes try to run zone eviction
 at the same time?
@@ -1016,55 +1019,146 @@ P1: TRYLOCK bucket C
 Not a problem, because the ringBufferPtr lock always blocks, and the zone Y
 lock would also block.
 
-PRINCIPLE 5: you can violate PRINCIPLE 3's bucket->zone order, but only if you
-use a trylock, AND all processes must lock (not trylock) some shared lock first
-before the trylock (i.e. the same bucket lock or the same zone lock).
+RULE 6: you can violate RULE 3's bucket->zone order and acquire a lock in
+zone->bucket order, but only if you use a trylock, AND all processes must lock
+(not trylock) either the same bucket lock or the same zone lock first, before
+the trylock.
+
+Is this kind of a trylock similar to wait/wound mutexes?
+https://github.com/torvalds/linux/tree/master/Documentation/locking
+
+
+The RACE CONDITION mentioned above is also fixed when using a trylock, without
+having to do anything for the RACE CONDITION separately. Instead of doing this
+(which demonstrates the race condition):
+---------------------------------------
+P1: LOCK zone Y
+                       P2: LOCK zone Y
+P1: LOCK some bucket
+P1: Unlink entry from
+    bucket A
+P1: UNLOCK some bucket
+P1: Free all chunks
+    of zone Y
+P1: UNLOCK zone Y
+                       P2: Read zone Y;
+                           get back empty or
+                           corrupted data
+                       P2: UNLOCK zone Y
+
+
+With trylocks we automatically get this:
+---------------------------------------
+P1: LOCK zone Y
+                       P2: LOCK zone Y
+P1: TRYLOCK some bucket
+    (fail)
+P1: UNLOCK zone Y
+                       P2: Read zone Y
+P1: LOCK zone Y
+                       P2: UNLOCK zone Y
+P1: TRYLOCK some bucket
+    (success)
+P1: Unlink entry from
+    bucket A
+P1: UNLOCK some bucket
+P1: Free all chunks
+    of zone Y
+P1: UNLOCK zone Y
 
 
 ##############################################################################
 #               Deadlock and livelock solution brainstorming                 #
 ##############################################################################
 
-(Most of this was written before the deadlock problem stuff above.)
+(Most of this was written before the deadlock solutions above, and some of it
+after. Therefore this section isn't necessarily in proper chronological order
+in relation to the other sections.)
 
 
 First idea (lock everything with an additional readers-writer-lock):
 ----------
 
-TODO: check if this is correct anymore.
+Hash table        _A__ _B__
+buckets         1|____|____|2______
+             _3____|    ^          |5
+            |           |___6__    |
+Entry  |____v__ ______|________|_ _v_|
+zones  |_______|______|__________|___|
+       |Zone|X        |Zone Y  ^     |
+            |         ^        |
+            |         |        |
+            |    ringBufferPtr |
+            |__________________|
+                      4
 
-- P1: LOCK HASH_AND_ZONE_EVICTION_LOCK for read
+1 P1: LOCK HASH_AND_ZONE_EVICTION_LOCK for read
 - P1: LOCK bucket A
-- P2: LOCK HASH_AND_ZONE_EVICTION_LOCK for read
+2 P2: LOCK HASH_AND_ZONE_EVICTION_LOCK for read
 - P2: LOCK bucket B
-- P1: LOCK zone X
+3 P1: LOCK zone X
 - P1: new value doesn't fit into existing chunk in zone X
-- P1: free zone X first chunk
+- P1: find zone for entry->hashNext (zone Y)
+- P1: free existing chunk in zone X
 - P1: UNLOCK zone X
+- P1: UNLOCK HASH_AND_ZONE_EVICTION_LOCK
+- Race condition or deadlock?
+  - P1 currently only holds bucket A lock
+  - If
+    - P3 locks HASH_AND_ZONE_EVICTION_LOCK (for read)
+    - and locks bucket A
+    > P3 blocks until P1 unlocks bucket A; no race condition
+  - If
+    - P3 locks HASH_AND_ZONE_EVICTION_LOCK (for read)
+    - and locks bucket C
+    - and locks zone Y
+    > P1 blocks until P3 unlocks HASH_AND_ZONE_EVICTION_LOCK
+  - If
+    - P3 locks HASH_AND_ZONE_EVICTION_LOCK (for read)
+    - and locks bucket C
+    - and locks zone Y
+    - and unlocks zone Y (no space for new value)
+    - and unlocks HASH_AND_ZONE_EVICTION_LOCK
+    - and locks HASH_AND_ZONE_EVICTION_LOCK (for write)
+    > P1 holds A and wants HASH_AND_ZONE_EVICTION_LOCK;
+      P3 holds HASH_AND_ZONE_EVICTION_LOCK and wants A (for eviction);
+      would be a deadlock, so this idea doesn't remove the need for trylocking (see RULE 5 & 6)
 - P1: LOCK HASH_AND_ZONE_EVICTION_LOCK for write
-  - Waits until P2 has UNLOCK its HASH_AND_ZONE_EVICTION_LOCK read lock
-- P2: LOCK zone Y
-- P2: read value from zone Y
-- P2: UNLOCK zone Y
-- P2: UNLOCK bucket B
+  - Waits until P2 has unlocked its HASH_AND_ZONE_EVICTION_LOCK read lock
 - P1: unlink entry from bucket A
-  - P1: find bucket for entry->hashNext (bucket B)
-  - P1: LOCK bucket B
-  - P1: update entry->hashNext->hashPrev
-  - P1: UNLOCK bucket B
-- P1: LOCK oldest zone via ringBufferPtr (zone Y)
-- P1: evict zone Y to make space for new values
+  - P1: LOCK zone for entry->hashNext (zone Y)
+  - P1: set bucket A head to be entry->hashNext->hashNext
+    - No race condition: zone Y's chunk at entry->hashNext->hashNext can't have
+      moved or been removed after unlocking X, as we still have lock A (see RULE 1)
+  - P1: UNLOCK zone Y
+- P1: LOCK ringBufferPtr (for oldest zone eviction)
+4 P1: LOCK zone Y (oldest zone via ringBufferPtr)
+5 P2: LOCK zone Y
+  - Waits until P1 unlocks Y below
+- P1: evict zone Y to make space for new values (free all chunks)
   - P1: free zone Y first chunk
   - P1: LOCK bucket A (again; recursive lock makes this OK)
-  - P1: unlink entry from bucket A
-  - P1: UNLOCK bucket A
+  - P1: unlink entry from bucket A (like above)
+  - P1: UNLOCK bucket A (still holds earlier lock of A)
   - P1: free zone Y second chunk
-  - P1: LOCK bucket B
+  6 P1: LOCK bucket B
+    - DEADLOCK: P1 has Y, wants B; P2 has B, wants Y
   - P1: unlink entry from bucket B
   - P1: UNLOCK bucket B
+- P1: ++ringBufferPtr
 - P1: write new value to zone Y
 - P1: UNLOCK zone Y
+- P1: UNLOCK ringBufferPtr
 - P1: UNLOCK bucket A
+- P1: UNLOCK HASH_AND_ZONE_EVICTION_LOCK
+- P2: read second chunk of zone Y
+- P2: UNLOCK zone Y
+- P2: UNLOCK bucket B
+- P2: UNLOCK HASH_AND_ZONE_EVICTION_LOCK
+
+In here the lock order must always be
+HASH_AND_ZONE_EVICTION_LOCK -> bucket lock -> zone lock -> ringBufferPtr lock
+to avoid deadlocks.
 
 (Btw, if our flock() readers-writer-lock implementation is slow, you might try
 to implement your own with sem_*() and shmop_*(), with a counter and
@@ -1145,5 +1239,30 @@ Fifth idea (use a buffer for value writes):
 ----------
 
 Copy the value-to-write to some temporary buffer until it can be flushed to a zone.
+
+
+##############################################################################
+#                             Locking principles                             #
+##############################################################################
+
+- Use a DAG if you can. It ensures there are no deadlocks.
+- Use lock hierarchies of you can, and only ever traverse the hierarchy in one
+  order (e.g. parent->child)
+- Don't keep two locks at the same time, if you can
+- If you need to lock two locks in whatever order, use a trylock. If you can,
+  use a trylock only in the other process/thread, because otherwise you have
+  the risk of livelocks.
+  - When you hold a lock, and trylocking another one fails, you can drop the
+    original lock and try both (lock A + trylock B) again. Be wary of livelocks.
+    This might be called a "wait/wound mutex".
+  - Or you could guard the trylock with a separate lock, which all processes
+    must acquire beforehand
+- Deadlocks occur because of _lock inversion_
+- When you're designing locks, visualize and draw!
+  - Draw out the resources that are to be protected by locks
+  - Draw out the locking order as lines and step numbers
+  - Write out the locking order as two columns for two processes/threads
+- When you're designing locks, think of the resources that need to be protected.
+  What _is_ a resource? A single "resource" might contain data in multiple places.
 
 
