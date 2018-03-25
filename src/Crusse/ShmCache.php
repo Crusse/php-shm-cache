@@ -390,7 +390,7 @@ class ShmCache {
 
   private function getHashBucketLock( $key ) {
 
-    $index = $this->memory->getHashTableBucketIndex( $key );
+    $index = $this->memory->getBucketIndex( $key );
 
     if ( !isset( $this->bucketLocks[ $index ] ) )
       $this->bucketLocks[ $index ] = new ShmCache\Lock( 'bucket'. $index );
@@ -475,7 +475,9 @@ class ShmCache {
         // item will replace 1 or more of the _oldest_ items (that are pointed to
         // by the ring buffer pointer).
         else {
-          if ( !$this->removeItem( $key, $chunkOffset ) )
+          if ( !$this->unlinkChunkFromHashTable( $key, $chunkOffset ) )
+            goto error;
+          if ( !$this->freeChunk( $chunkOffset ) )
             goto error;
         }
       }

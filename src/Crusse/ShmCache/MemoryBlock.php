@@ -260,6 +260,7 @@ class MemoryBlock {
       $this->writeChunkMeta(
         $i * self::ZONE_SIZE + self::ZONE_META_SIZE,
         '',
+        0,
         $this->MAX_CHUNK_SIZE - $this->CHUNK_META_SIZE,
         0,
         0
@@ -495,6 +496,7 @@ class MemoryBlock {
     return $nextItemOffset;
   }
 
+  // FIXME: delete this?
   private function addItemKey( $key, $itemMetaOffset ) {
 
     $i = 0;
@@ -522,6 +524,7 @@ class MemoryBlock {
     return $this->writeItemKey( $index, $itemMetaOffset );
   }
 
+  // FIXME: delete this?
   private function updateItemKey( $key, $itemMetaOffset ) {
 
     $hashTableIndex = $this->getHashTableEntryOffset( $key );
@@ -534,46 +537,18 @@ class MemoryBlock {
     return $this->writeItemKey( $hashTableIndex, $itemMetaOffset );
   }
 
-  private function writeItemKey( $hashTableIndex, $itemMetaOffset ) {
-
-    $hashTableOffset = $this->KEYS_START + $hashTableIndex * $this->LONG_SIZE;
-    $data = pack( 'l', $itemMetaOffset );
-
-    $ret = shmop_write( $this->shm, $data, $hashTableOffset );
-
-    if ( $ret === false ) {
-      trigger_error( 'Could not write item key' );
-      return false;
-    }
-
-    return true;
-  }
-
   /**
    * Returns an offset in the zones area, to the chunk whose key matches
    * the given key.
    */
   private function getChunkOffset( $key ) {
 
-    $bucketIndex = $this->getHashTableBucketIndex( $key );
-    $chunkOffset = $this->getHeadChunkOffsetForBucketIndex( $bucketIndex );
+    $bucketIndex = $this->getBucketIndex( $key );
+    $chunkOffset = $this->getBucketHeadChunkOffset( $bucketIndex );
 
-    if ( $chunkOffset < 0 )
-      return -1;
+    while ( $chunkOffset >= 0 ) {
 
-    while ( $chunkOffset ) {
-
-      // Read a chunk's "key" and "hashnext" properties
-      $data = shmop_read(
-        $this->shm,
-        $this->zonesArea->startOffset + $chunkOffset,
-        self::MAX_KEY_LENGTH + $this->LONG_SIZE
-      );
-
-      if ( !$data )
-        break;
-
-      $props = unpack( 'A'. self::MAX_KEY_LENGTH .'key/lhashnext', $data );
+      $props = $this->getChunkKeyAndHashNext( $chunkOffset );
 
       if ( $props[ 'key' ] === $key )
         return $chunkOffset;
@@ -584,10 +559,81 @@ class MemoryBlock {
     return -1;
   }
 
+  private function getChunkKeyAndHashNext( $chunkOffset ) {
+
+    // Read a chunk's "key" and "hashnext" properties
+    $data = shmop_read(
+      $this->shm,
+      $this->zonesArea->startOffset + $chunkOffset,
+      self::MAX_KEY_LENGTH + $this->LONG_SIZE
+    );
+
+    if ( !$data )
+      return null;
+
+    $ret = unpack( 'A'. self::MAX_KEY_LENGTH .'key/lhashnext', $data );
+
+    return $ret;
+  }
+
+  private function getChunkHashNext( $chunkOffset ) {
+
+    // Read a chunk's "key" property
+    $data = shmop_read(
+      $this->shm,
+      $this->zonesArea->startOffset + $chunkOffset,
+      $this->LONG_SIZE
+    );
+
+    if ( !$data )
+      return null;
+
+    $ret = unpack( 'l', $data )[ 0 ];
+
+    return $ret ?: -1;
+  }
+
+  private function findChunkHashPrev( $bucketIndex, $chunkOffset ) {
+
+    $currentChunk = $this->getBucketHeadChunkOffset( $bucketIndex );
+
+    while ( $currentChunk >= 0 ) {
+      $nextChunk = $this->getChunkHashNext( $currentChunk );
+      if ( $nextChunk == $chunkOffset )
+        return $currentChunk;
+      $currentChunk = $nextChunk;
+    }
+
+    return -1;
+  }
+
+  /**
+   * Returns an index in the key hash table, to the first element of the
+   * hash table item cluster (i.e. bucket) for the given key.
+   *
+   * The hash function must result in as uniform as possible a distribution
+   * of bits over all the possible $key values. CRC32 looks pretty good:
+   * http://michiel.buddingh.eu/distribution-of-hash-values
+   *
+   * @return int
+   */
+  private function getBucketIndex( $key ) {
+
+    $hash = hash( 'crc32', $key, true );
+
+    // Read as a 32-bit unsigned long
+    // TODO: unpack() is slow. Is there an alternative?
+    $index = unpack( 'L', $hash )[ 1 ];
+    // Modulo by the amount of hash table buckets to get an array index
+    $index %= self::HASH_BUCKET_COUNT;
+
+    return $index;
+  }
+
   /**
    * @return int A chunk offset relative to the zones area
    */
-  private function getHeadChunkOffsetForBucketIndex( $index ) {
+  private function getBucketHeadChunkOffset( $index ) {
 
     $data = shmop_read(
       $this->shm,
@@ -606,48 +652,47 @@ class MemoryBlock {
     return unpack( 'l', $data )[ 1 ];
   }
 
-  /**
-   * Returns an index in the key hash table, to the first element of the
-   * hash table item cluster (i.e. bucket) for the given key.
-   *
-   * The hash function must result in as uniform as possible a distribution
-   * of bits over all the possible $key values. CRC32 looks pretty good:
-   * http://michiel.buddingh.eu/distribution-of-hash-values
-   *
-   * @return int
-   */
-  private function getHashTableBucketIndex( $key ) {
+  private function setBucketHeadChunkOffset( $bucketIndex, $itemMetaOffset ) {
 
-    $hash = hash( 'crc32', $key, true );
+    $hashTableOffset = $this->KEYS_START + $hashTableIndex * $this->LONG_SIZE;
+    $data = pack( 'l', $itemMetaOffset );
 
-    // Read as a 32-bit unsigned long
-    // TODO: unpack() is slow. Is there an alternative?
-    $index = unpack( 'L', $hash )[ 1 ];
-    // Modulo by the amount of hash table buckets to get an array index
-    $index %= self::HASH_BUCKET_COUNT;
+    $ret = shmop_write( $this->shm, $data, $hashTableOffset );
 
-    return $index;
+    if ( $ret === false ) {
+      trigger_error( 'Could not write item key' );
+      return false;
+    }
+
+    return true;
   }
 
-  /**
-   * Remove the item hash table entry and frees its chunk.
-   */
-  private function removeItem( $key, $chunkOffset ) {
+  private function unlinkChunkFromHashTable( $key, $chunkOffset ) {
 
-    $bucketIndex = $this->getHashTableBucketIndex( $key );
-    $bucketHeadChunkOffset = $this->getHeadChunkOffsetForBucketIndex( $bucketIndex );
+    $bucketIndex = $this->getBucketIndex( $key );
+    $bucketHeadChunkOffset = $this->getBucketHeadChunkOffset( $bucketIndex );
 
-    // Hash table bucket is empty
     if ( $bucketHeadChunkOffset < 0 ) {
-      trigger_error( 'Item "'. rawurlencode( $key ) .'" has no element in the hash table' );
+      trigger_error( 'Item "'. rawurlencode( $key ) .'"\'s bucket is empty' );
       return false;
     }
 
-    // Clear the hash table key
-    if ( !$this->writeItemKey( $hashTableIndex, 0 ) ) {
-      trigger_error( 'Could not free the item "'. rawurlencode( $key ) .'" key' );
+    $nextChunk = $this->getChunkHashNext( $chunkOffset );
+
+    if ( $chunkOffset == $bucketHeadChunkOffset )
+      return $this->setBucketHeadChunkOffset( $bucketIndex, $nextChunk );
+
+    $prevChunk = $this->findChunkHashPrev( $bucketIndex, $chunkOffset );
+    if ( $prevChunk < 0 )
       return false;
-    }
+
+    //              ________________
+    //             |                v
+    // Link prevChunk currentChunk nextChunk
+    //
+    $this->writeChunkMeta( $prevChunk, null, $nextChunk );
+
+    // TODO TODO TODO
 
     // Make the value space free by setting the valsize to 0
     if ( shmop_write( $this->shm, pack( 'l', 0 ), $itemOffset + self::MAX_KEY_LENGTH + $this->LONG_SIZE ) === false ) {
