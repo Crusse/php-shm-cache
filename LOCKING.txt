@@ -1246,9 +1246,9 @@ Copy the value-to-write to some temporary buffer until it can be flushed to a zo
 ##############################################################################
 
 - Stats lock: locks all access to the stats memory region
-- Bucket lock: locks a hash table bucket, and the hashNext property of all
+- Bucket locks: locks a hash table bucket, and the hashNext property of all
   entries in that bucket
-- Zone lock: locks a single zone and all chunks in it
+- Zone locks: locks a single zone and all chunks in it
 - Ring buffer pointer lock: locks the ring buffer pointer
 
 

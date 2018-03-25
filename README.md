@@ -4,6 +4,10 @@ Data is persisted across multiple runs of a PHP script.
 The cached items have no expiration time. The cache has a FIFO queue which
 starts removing oldest items once the cache gets full.
 
+This library is intended as a hobby project for myself to learn about shared
+memory and locking in a familiar context (PHP). (I'm essentially "programming
+FORTRAN in any language" here.) Use at your own risk.
+
 *NOTE:*
 
 When there are parallel reads and writes (as there are on websites), locking
@@ -63,8 +67,6 @@ Run `vendor/bin/phpunit`.
 
 ## Performance
 
-I've measured that this is faster than a local Memcached over TCP called from PHP,
-both on PHP 5 and PHP 7, when there are no parallel reads and writes going on.
 The main performance hit is from PHP's `serialize()` and `unserialize()` when
 storing non-strings. Strings are stored as-is, so they don't have the overhead
 of `serialize()` and `unserialize()`.
