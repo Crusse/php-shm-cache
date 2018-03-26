@@ -87,6 +87,9 @@ class MemoryBlock {
   public $hashBucketArea;
   public $zonesArea;
 
+  private $statsProto;
+  private $chunkProto;
+
   function __construct( $desiredSize ) {
 
     // PHP doesn't allow complex expressions in class consts so we'll create
@@ -124,6 +127,57 @@ class MemoryBlock {
 
     if ( $retIsNewBlock )
       $this->clearMemBlockToInitialData();
+
+    static::initializeStatics();
+  }
+
+  static function initializeStatics() {
+
+    if ( static::$staticsInitialized )
+      return;
+
+    static::$staticsInitialized = true;
+
+    $this->statsProto = ShmBackedObject::createPrototype( $this->shm, [
+      'gethits' => [
+        'offset' => 0,
+        'size' => $this->LONG_SIZE,
+        'packformat' => 'l'
+      ],
+      'getmisses' => [
+        'offset' => $this->LONG_SIZE,
+        'size' => $this->LONG_SIZE,
+        'packformat' => 'l'
+      ]
+    ] );
+
+    $this->chunkProto = ShmBackedObject::createPrototype( $this->shm, [
+      'key' => [
+        'offset' => 0,
+        'size' => self::MAX_KEY_LENGTH,
+        'packformat' => 'A'. self::MAX_KEY_LENGTH
+      ],
+      'hashnext' => [
+        'offset' => self::MAX_KEY_LENGTH,
+        'size' => $this->LONG_SIZE,
+        'packformat' => 'l'
+      ],
+      'valallocsize' => [
+        'offset' => self::MAX_KEY_LENGTH + $this->LONG_SIZE,
+        'size' => $this->LONG_SIZE,
+        'packformat' => 'l'
+      ],
+      'valsize' => [
+        'offset' => self::MAX_KEY_LENGTH + 2 * $this->LONG_SIZE,
+        'size' => $this->LONG_SIZE,
+        'packformat' => 'l'
+      ],
+      'flags' => [
+        'offset' => self::MAX_KEY_LENGTH + 3 * $this->LONG_SIZE,
+        'size' => $this->CHAR_SIZE,
+        'packformat' => 'c'
+      ]
+    ] );
   }
 
   function __destruct() {
@@ -256,15 +310,15 @@ class MemoryBlock {
 
     // Initialize zones
     for ( $i = 0; $i < $this->ZONE_COUNT; $i++ ) {
+
       $this->setZoneStackPointer( 1, 0 );
-      $this->writeChunkMeta(
-        $i * self::ZONE_SIZE + self::ZONE_META_SIZE,
-        '',
-        0,
-        $this->MAX_CHUNK_SIZE - $this->CHUNK_META_SIZE,
-        0,
-        0
-      );
+
+      $obj = $this->chunkProto->createInstance( $i * self::ZONE_SIZE + self::ZONE_META_SIZE );
+      $obj->key = '';
+      $obj->hashnext = 0;
+      $obj->valallocsize = $this->MAX_CHUNK_SIZE - $this->CHUNK_META_SIZE;
+      $obj->valsize = 0;
+      $obj->flags = 0;
     }
 
     $this->setOldestZoneIndex( $this->ZONE_COUNT - 1 );
@@ -394,50 +448,6 @@ class MemoryBlock {
 
     if ( $ret === false ) {
       trigger_error( 'Could not write zone '. $zoneIndex .' stack pointer' );
-      return false;
-    }
-
-    return true;
-  }
-
-  /**
-   * If you give an argument to any of the nullable parameters, ALL parameters
-   * after that MUST also be set.
-   *
-   * @param int $hashNextOffset Next hash table entry, relative to the whole zones area start
-   */ 
-  private function writeChunkMeta( $zoneAreaOffset, $key = null, $hashNextOffset = null, $valueAllocatedSize = null, $valueSize = null, $flags = null ) {
-
-    $data = '';
-    $writeOffset = $this->zonesArea->startOffset + $zoneAreaOffset;
-
-    if ( $key !== null )
-      $data .= pack( 'A'. self::MAX_KEY_LENGTH, $key );
-    else
-      $writeOffset += self::MAX_KEY_LENGTH;
-
-    if ( $hashNextOffset !== null )
-      $data .= pack( 'l', $hashNextOffset );
-    else if ( $key === null )
-      $writeOffset += $this->LONG_SIZE;
-
-    if ( $valueAllocatedSize !== null )
-      $data .= pack( 'l', $valueAllocatedSize );
-    else if ( $key === null )
-      $writeOffset += $this->LONG_SIZE;
-
-    if ( $valueSize !== null )
-      $data .= pack( 'l', $valueSize );
-    else if ( $key === null && $valueAllocatedSize === null )
-      $writeOffset += $this->LONG_SIZE;
-
-    if ( $flags !== null )
-      $data .= pack( 'c', $flags );
-
-    $ret = shmop_write( $this->shm, $data, $writeOffset );
-
-    if ( $ret === false ) {
-      trigger_error( 'Could not write cache item metadata' );
       return false;
     }
 
