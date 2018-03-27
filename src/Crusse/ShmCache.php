@@ -447,109 +447,68 @@ class ShmCache {
   private function _set( $key, $value, $valueIsSerialized ) {
 
     $newValueSize = strlen( $value );
-    $chunkOffset = $this->getChunkOffset( $key );
+    $existingChunk = $this->getChunkByKey( $key );
 
-    if ( $chunkOffset >= 0 ) {
+    if ( $existingChunk ) {
 
-      $existingChunk = $this->getChunkMetaByOffset( $chunkOffset, false );
+      // There's enough space for the new value in the existing chunk.
+      // Replace the value in-place.
+      if ( $newValueSize <= $existingChunk->valallocsize ) {
 
-      if ( $existingChunk ) {
-        // There's enough space for the new value in the existing chunk.
-        // Replace the value in-place.
-        if ( $newValueSize <= $existingChunk[ 'valallocsize' ] ) {
+        $flags = 0;
+        if ( $valueIsSerialized )
+          $flags |= self::FLAG_SERIALIZED;
 
-          $flags = 0;
-          if ( $valueIsSerialized )
-            $flags |= self::FLAG_SERIALIZED;
+        $existingChunk->valsize = $newValueSize;
+        $existingChunk->flags = $flags;
 
-          if ( !$this->writeChunkMeta( $chunkOffset, null, null, null, $newValueSize, $flags ) )
-            goto error;
-          if ( !$this->writeChunkValue( $chunkOffset, $value ) )
-            goto error;
+        if ( !$this->writeChunkValue( $chunk->_startOffset, $value ) )
+          goto error;
 
-          goto success;
-        }
-        // The new value is too large to fit into the existing item's spot, and
-        // would overwrite 1 or more items to the right of it. We'll instead
-        // remove the existing item, and handle this as a new value, so that this
-        // item will replace 1 or more of the _oldest_ items (that are pointed to
-        // by the ring buffer pointer).
-        else {
-          if ( !$this->unlinkChunkFromHashTable( $key, $chunkOffset ) )
-            goto error;
-          if ( !$this->freeChunk( $chunkOffset ) )
-            goto error;
-        }
+        goto success;
+      }
+      // The new value is too large to fit into the existing item's spot, and
+      // would overwrite 1 or more items to the right of it. We'll instead
+      // remove the existing item, and handle this as a new value, so that this
+      // item will replace 1 or more of the _oldest_ items (that are pointed to
+      // by the ring buffer pointer).
+      else {
+        if ( !$this->removeChunk( $existingChunk ) )
+          goto error;
       }
     }
 
-    // Don't need this anymore
-    unset( $index );
-
     // Note: whenever we cannot store the value to the cache, we remove any
-    // existing item with the same key (in removeItem() above). This emulates memcached:
+    // existing item with the same key (in removeChunk() above). This emulates Memcached:
     // https://github.com/memcached/memcached/wiki/Performance#how-it-handles-set-failures
-    if ( $newValueSize > self::MAX_CHUNK_SIZE ) {
+    if ( $newValueSize > $this->MAX_CHUNK_SIZE ) {
       trigger_error( 'Item "'. rawurlencode( $key ) .'" is too large ('. round( $newValueSize / 1000, 2 ) .' KB) to cache' );
       goto error;
     }
 
-    $itemsToRemove = self::FULL_CACHE_REMOVED_ITEMS;
-
-    // TODO: metadata lock
-    $oldestItemOffset = $this->getOldestZoneIndex();
-    if ( $oldestItemOffset <= 0 )
+    $newestZoneIndex = $this->getNewestZoneIndex();
+    if ( $newestZoneIndex < 0 )
       goto error;
-    $replacedItem = $this->getChunkMetaByOffset( $oldestItemOffset );
-    if ( !$replacedItem )
-      goto error;
-    $replacedItemOffset = $oldestItemOffset;
-    if ( $replacedItem[ 'valsize' ] ) {
-      if ( !$this->removeItem( $replacedItem[ 'key' ], $replacedItemOffset ) )
-        goto error;
-      --$itemsToRemove;
-    }
 
-    $allocatedSize = $replacedItem[ 'valallocsize' ];
-    $nextItemOffset = $this->getNextItemOffset( $replacedItemOffset, $allocatedSize );
+    $zoneMeta = $this->getZoneMetaByIndex( $newestZoneIndex );
+    $zoneFreeSpace = $this->getZoneFreeSpace( $zoneMeta );
 
-    // The new value doesn't fit into an existing cache item. Make space for the
-    // new value by merging next oldest cache items one by one into the current
-    // cache item, until we have enough space.
-    while ( $allocatedSize < $newValueSize ) {
+    // The new value doesn't fit into the oldest zone. Make space for the new
+    // value by evicting all chunks in the oldest zone.
+    if ( $zoneFreeSpace < $newValueSize ) {
 
-      // Loop around if we reached the end of the zones area
-      if ( !$nextItemOffset ) {
-
-        // Free the first item
-        $firstItem = $this->getChunkMetaByOffset( $this->VALUES_START );
-        if ( !$firstItem )
-          goto error;
-        if ( $firstItem[ 'valsize' ] ) {
-          if ( !$this->removeItem( $firstItem[ 'key' ], $this->VALUES_START ) )
-            goto error;
-        }
-        $replacedItemOffset = $this->VALUES_START;
-        $allocatedSize = $firstItem[ 'valallocsize' ];
-        $nextItemOffset = $this->getNextItemOffset( $this->VALUES_START, $allocatedSize );
-
-        continue;
-      }
-
-      $nextItem = $this->getChunkMetaByOffset( $nextItemOffset );
-      if ( !$nextItem )
+      // TODO: oldestZoneIndexLock
+      $oldestZoneIndex = $this->getOldestZoneIndex();
+      if ( $oldestZoneIndex < 0 )
         goto error;
 
-      if ( $nextItem[ 'valsize' ] ) {
-        if ( !$this->removeItem( $nextItem[ 'key' ], $nextItemOffset ) )
-          goto error;
-      }
+      $zoneMeta = $this->getZoneMetaByIndex( $oldestZoneIndex );
+      $zoneFreeSpace = $this->getZoneFreeSpace( $zoneMeta );
 
-      // Merge the next item's space into this item
-      $itemAllocSize = $nextItem[ 'valallocsize' ];
-      $allocatedSize += $this->CHUNK_META_SIZE + $itemAllocSize;
-      $nextItemOffset = $this->getNextItemOffset( $nextItemOffset, $itemAllocSize );
+      $this->removeAllChunksInZone( $zoneMeta );
     }
+
+    // TODO TODO TODO
 
     $splitSlotSize = $allocatedSize - $newValueSize;
 

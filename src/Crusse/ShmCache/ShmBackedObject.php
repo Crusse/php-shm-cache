@@ -8,19 +8,25 @@ namespace Crusse\ShmCache;
  */
 class ShmBackedObject {
 
-  public $_shmBlock;
+  public $_shm;
   public $_startOffset;
   public $_properties;
+  public $_size;
 
   /**
    * @param array $propertiesSpec E.g. ['offset' => 8, 'size' => 4, 'packformat' => 'l']
    */
-  static function createPrototype( $shmBlock, array $propertiesSpec ) {
+  static function createPrototype( MemoryArea $memory, array $propertiesSpec ) {
 
     $proto = new static;
-    $proto->_shmBlock = $shmBlock;
+    $proto->_memory = $memory;
     $proto->_properties = $propertiesSpec;
     $proto->_startOffset = 0;
+    $proto->_size = 0;
+
+    foreach ( $propertiesSpec as $propName => $spec ) {
+      $proto->_size += $spec[ 'size' ];
+    }
 
     return $proto;
   }
@@ -44,13 +50,9 @@ class ShmBackedObject {
     if ( !isset( $prop ) )
       throw new \Exception( $name .' does not exist' );
 
-    $data = shmop_read(
-      $this->_shmBlock,
-      $this->_startOffset + $prop[ 'offset' ],
-      $prop[ 'size' ]
-    );
+    $data = $this->_memory->read( $prop[ 'offset' ], $prop[ 'size' ] );
 
-    if ( !$data )
+    if ( $data === false )
       return null;
 
     return unpack( $prop[ 'packformat' ], $data )[ 0 ];
@@ -68,13 +70,9 @@ class ShmBackedObject {
     if ( !isset( $prop ) )
       throw new \Exception( $name .' does not exist' );
 
-    $wrote = shmop_write(
-      $this->_shmBlock,
-      pack( $prop[ 'packformat' ], $value ),
-      $this->_startOffset + $prop[ 'offset' ]
-    );
+    $written = $this->_memory->write( $prop[ 'offset' ], pack( $prop[ 'packformat' ], $value ) );
 
-    if ( !$wrote )
+    if ( !$written )
       return false;
 
     return true;
