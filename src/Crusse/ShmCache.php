@@ -266,13 +266,13 @@ class ShmCache {
 
       if ( $metaOffset > 0 ) {
 
-        $item = $this->getChunkMetaByOffset( $metaOffset, false );
+        $item = $this->getChunkByOffset( $metaOffset );
 
         if ( $item ) {
           if ( !$item[ 'valsize' ] )
             $ret = true;
           else
-            $ret = $this->removeItem( $key, $metaOffset );
+            $ret = $this->removeChunk( $key, $metaOffset );
         }
       }
     }
@@ -368,7 +368,7 @@ class ShmCache {
     for ( $i = $this->VALUES_START; $i < $this->VALUES_START + $this->VALUES_SIZE; ) {
 
       // TODO: acquire item lock?
-      $item = $this->getChunkMetaByOffset( $i );
+      $item = $this->getChunkByOffset( $i );
 
       if ( $item[ 'valsize' ] ) {
         ++$ret->items;
@@ -423,7 +423,7 @@ class ShmCache {
 
       if ( $metaOffset > 0 ) {
 
-        $item = $this->getChunkMetaByOffset( $metaOffset, false );
+        $item = $this->getChunkByOffset( $metaOffset );
 
         if ( $item ) {
 
@@ -503,46 +503,48 @@ class ShmCache {
         goto error;
 
       $zoneMeta = $this->getZoneMetaByIndex( $oldestZoneIndex );
-      $zoneFreeSpace = $this->getZoneFreeSpace( $zoneMeta );
+      if ( !$this->removeAllChunksInZone( $zoneMeta ) )
+        goto error;
 
-      $this->removeAllChunksInZone( $zoneMeta );
+      $this->setOldestZoneIndex( $oldestZoneIndex + 1 );
     }
+
+    $leftOverSize = $zoneFreeSpace - $newValueSize;
+    $freeChunk = $this->getChunkByOffset( $this->getZoneFreeChunkOffset( $zoneMeta ) );
 
     // TODO TODO TODO
 
-    $splitSlotSize = $allocatedSize - $newValueSize;
+    // Split the chunk into two, if there is enough space left over
+    if ( $leftOverSize >= $this->CHUNK_META_SIZE + self::MIN_VALUE_ALLOC_SIZE ) {
 
-    // Split the cache item into two, if there is enough space left over
-    if ( $splitSlotSize >= $this->CHUNK_META_SIZE + self::MIN_VALUE_ALLOC_SIZE ) {
+      $leftOverChunkOffset = $freeChunk->_endOffset + $newValueSize;
+      $leftOverChunkValAllocSize = $leftOverSize - $this->CHUNK_META_SIZE;
 
-      $splitSlotOffset = $replacedItemOffset + $this->CHUNK_META_SIZE + $newValueSize;
-      $splitItemValAllocSize = $splitSlotSize - $this->CHUNK_META_SIZE;
+      $leftOverChunk = $this->getChunkByOffset( $leftOverChunkOffset );
+      $leftOverChunk->key = '';
+      $leftOverChunk->hashnext = 0;
+      $leftOverChunk->valallocsize = $this->MAX_CHUNK_SIZE - $this->CHUNK_META_SIZE;
+      $leftOverChunk->valsize = 0;
+      $leftOverChunk->flags = 0;
 
-      if ( !$this->writeChunkMeta( $splitSlotOffset, '', $splitItemValAllocSize, 0, 0 ) )
-        goto error;
-
-      $allocatedSize -= $splitSlotSize;
-      $nextItemOffset = $splitSlotOffset;
+      $freeChunk->valallocsize -= $leftOverSize;
     }
 
     $flags = 0;
     if ( $valueIsSerialized )
       $flags |= self::FLAG_SERIALIZED;
 
-    if ( !$this->writeChunkMeta( $replacedItemOffset, $key, $allocatedSize, $newValueSize, $flags ) )
-      goto error;
-    if ( !$this->writeChunkValue( $replacedItemOffset, $value ) )
+    $freeChunk->key = $key;
+    $freeChunk->valsize = $newValueSize;
+    $freeChunk->flags = $flags;
+
+    if ( !$this->writeChunkValue( $freeChunk, $value ) )
       goto error;
 
-    if ( !$this->addItemKey( $key, $replacedItemOffset ) )
+    if ( !$this->linkChunkToHashTable( $freeChunk ) )
       goto error;
 
-    $newBufferPtr = ( $nextItemOffset )
-      ? $nextItemOffset
-      : $this->VALUES_START;
-
-    if ( !$this->setOldestZoneIndex( $newBufferPtr ) )
-      goto error;
+    $zoneMeta->usedspace += $freeChunk->_size + $freeChunk->valallocsize;
 
     success:
     return true;
@@ -553,32 +555,6 @@ class ShmCache {
 
   private function sanitizeKey( $key ) {
     return substr( $key, 0, self::MAX_KEY_LENGTH );
-  }
-
-  private function mergeItemWithNextFreeValueSlots( $itemOffset ) {
-
-    $item = $this->getChunkMetaByOffset( $itemOffset, false );
-    $allocSize = $origAllocSize = $item[ 'valallocsize' ];
-    $nextItemOffset = $this->getNextItemOffset( $itemOffset, $allocSize );
-
-    while ( $nextItemOffset ) {
-      $nextItem = $this->getChunkMetaByOffset( $nextItemOffset, false );
-      if ( $nextItem[ 'valsize' ] )
-        break;
-      $thisItemAllocSize = $nextItem[ 'valallocsize' ];
-      $allocSize += $this->CHUNK_META_SIZE + $thisItemAllocSize;
-      $nextItemOffset = $this->getNextItemOffset( $nextItemOffset, $thisItemAllocSize );
-    }
-
-    if ( $allocSize !== $origAllocSize ) {
-      // Resize
-      $this->writeChunkMeta( $itemOffset, null, $allocSize );
-      $bufferPtr = $this->getOldestZoneIndex();
-      if ( $bufferPtr > $itemOffset && $bufferPtr < $itemOffset + $allocSize )
-        $this->setOldestZoneIndex( $itemOffset );
-    }
-
-    return $allocSize;
   }
 
   private function flushBufferedStatsToShm() {

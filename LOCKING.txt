@@ -480,7 +480,7 @@ shmop_move() function. Consider some options:
 - A zone is not a stack, but contains variable-size chunks anywhere in it
   - Instead of the global free-list, each zone contains its own free-list,
     like Memcached
-- A zone is a stack, but when freing a chunk, and there is an adjacent
+- A zone is a stack, but when freeing a chunk, and there is an adjacent
   non-free chunk to the right of it, don't free it, and mark it as "dirty".
   When the chunk to the right of it is freed, also free this chunk. In short,
   only free a chunk when it's the top chunk in the non-free stack.
@@ -1289,7 +1289,7 @@ Generic stuff I've learned so far:
 - Use a DAG (e.g. a singly-linked list) if you can, which makes handling
   deadlocks a lot easier than more complicated graphs (i.e. ones with cycles)
 - Use lock hierarchies of you can, and only ever traverse the hierarchy in one
-  order (e.g. parent->child)
+  direction (e.g. parent->child)
 - Don't keep two locks at the same time, if you can
 - If you need to lock two locks in whatever order, use a trylock. If you can,
   use a trylock only in the other process/thread, because otherwise you have

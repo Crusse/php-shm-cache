@@ -10,8 +10,9 @@ class ShmBackedObject {
 
   public $_shm;
   public $_startOffset;
-  public $_properties;
   public $_size;
+  public $_endOffset;
+  public $_properties;
 
   /**
    * @param array $propertiesSpec E.g. ['offset' => 8, 'size' => 4, 'packformat' => 'l']
@@ -27,6 +28,8 @@ class ShmBackedObject {
     foreach ( $propertiesSpec as $propName => $spec ) {
       $proto->_size += $spec[ 'size' ];
     }
+
+    $proto->_endOffset = $proto->_startOffset + $proto->_size;
 
     return $proto;
   }

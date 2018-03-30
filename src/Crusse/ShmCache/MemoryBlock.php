@@ -36,7 +36,8 @@ namespace Crusse\ShmCache;
  *
  *     A zone's usedspace can be used to calculate the first free chunk in
  *     that zone. All chunks up to that point is memory in use; all chunks
- *     after that point is free space.
+ *     after that point is free space. usedspace is therefore essentially
+ *     a stack pointer.
  *
  *     Each zone is roughly in the order in which the zones were created, so
  *     that we can easily find the oldest zones for eviction, to make space for
@@ -55,7 +56,7 @@ namespace Crusse\ShmCache;
  *     If 'valsize' is 0, that value slot is free.
  *
  *     'valallocsize' is how big the allocated size is. This is usually the
- *     same as 'valsize', but can be larger if the value was changed to
+ *     same as 'valsize', but can be larger if the value was replaced with
  *     a smaller value later, or if the 'valsize' < MIN_VALUE_ALLOC_SIZE.
  *
  *     CHUNK_META_SIZE = sizeof(key) + sizeof(hashnext) + sizeof(valallocsize) + sizeof(valsize) + sizeof(flags)
@@ -68,7 +69,7 @@ class MemoryBlock {
   const DEFAULT_CACHE_SIZE = 134217728;
   const SAFE_AREA_SIZE = 1024;
   // Don't let value allocations become smaller than this, to reduce fragmentation
-  const MIN_VALUE_ALLOC_SIZE = 32;
+  const MIN_VALUE_ALLOC_SIZE = 128;
   const ZONE_SIZE = 1048576; // 1 MiB
   // If a key string is longer than this, the key is truncated silently
   const MAX_KEY_LENGTH = 200;
@@ -145,8 +146,6 @@ class MemoryBlock {
     ] );
 
     $this->zoneMetaProto = ShmBackedObject::createPrototype( $this->zonesArea, [
-      // First free chunk's offset in this zone. Relative to the zone's
-      // chunksarea start.
       'usedspace' => [
         'offset' => 0,
         'size' => $this->LONG_SIZE,
@@ -217,12 +216,27 @@ class MemoryBlock {
 
   function removeChunk( ShmBackedObject $chunk ) {
 
+    $chunkValAllocSize = $chunk->valallocsize;
+    $chunkTotalSize = $chunk->_size + $chunkValAllocSize;
+    $nextChunkOffset = $chunk->_endOffset + $chunkValAllocSize;
+
     if ( !$this->unlinkChunkFromHashTable( $chunk ) )
       return false;
 
     $chunk->valsize = 0;
 
-    // TODO: merge with neighboring chunks, if they're dirty or free
+    if ( !$this->mergeChunkWithNextFreeChunks( $chunk ) )
+      return false;
+
+    $zoneMeta = $this->getZoneMetaForChunk( $chunk );
+
+    if ( !$zoneMeta )
+      return false;
+
+    // This is the top chunk in the zone's chunk stack. Adjust the zone's chunk
+    // stack pointer.
+    if ( $this->getZoneFreeChunkOffset( $zoneMeta ) === $nextChunkOffset )
+      $zoneMeta->usedspace -= $chunkTotalSize;
 
     return true;
   }
@@ -231,18 +245,40 @@ class MemoryBlock {
     return $this->zoneMetaProto->createInstance( $zoneIndex * self::ZONE_SIZE );
   }
 
+  function getZoneMetaForChunk( ShmBackedObject $chunk ) {
+   
+    $chunkOffsetRelativeToZonesStart = $chunk->_startOffset - $this->zonesArea->startOffset;
+
+    return $this->getZoneMetaByIndex( $chunkOffsetRelativeToZonesStart % self::ZONE_SIZE );
+  }
+
   function getZoneFreeSpace( ShmBackedObject $zoneMeta ) {
     return $this->MAX_CHUNK_SIZE - $zoneMeta->usedspace;
   }
 
-  function removeAllChunksInZone( ShmBackedObject $zone ) {
+  function getZoneFreeChunkOffset( ShmBackedObject $zoneMeta ) {
+    return $zoneMeta->_endOffset + $zoneMeta->usedspace;
+  }
 
-    $chunk = $this->getChunkByOffset( $zone->_startOffset + $this->ZONE_META_SIZE );
+  function removeAllChunksInZone( ShmBackedObject $zoneMeta ) {
+
+    $firstChunk = $chunk = $this->getChunkByOffset( $zoneMeta->_endOffset );
 
     while ( $chunk ) {
-      $this->removeChunk( $chunk );
-      $chunk = $this->getChunkByOffset( $zone->_startOffset + $this->ZONE_META_SIZE );
+
+      if ( !$this->unlinkChunkFromHashTable( $chunk ) )
+        return false;
+
+      $chunk->valsize = 0;
+      $chunk = $this->getChunkByOffset( $chunk->_endOffset + $chunk->valallocsize );
     }
+
+    $firstChunk->valallocsize = $this->MAX_CHUNK_SIZE;
+
+    // Reset the zone's chunk stack pointer
+    $zone->usedspace = 0;
+
+    return true;
   }
 
   private function initMemBlock( $desiredSize, &$retIsNewBlock ) {
@@ -286,15 +322,14 @@ class MemoryBlock {
 
     $this->BLOCK_SIZE = shmop_size( $this->shm );
 
-    $this->ZONE_META_SIZE = $this->LONG_SIZE;
-
     $allocatedSize = $this->LONG_SIZE;
     $hashNextSize = $this->LONG_SIZE;
     $valueSize = $this->LONG_SIZE;
     $flagsSize = $this->CHAR_SIZE;
     $this->CHUNK_META_SIZE = self::MAX_KEY_LENGTH + $hashNextSize + $allocatedSize + $valueSize + $flagsSize;
 
-    $this->MAX_CHUNK_SIZE = self::ZONE_SIZE - $this->ZONE_META_SIZE;
+    $zoneMetaSize = $this->LONG_SIZE;
+    $this->MAX_CHUNK_SIZE = self::ZONE_SIZE - $zoneMetaSize;
 
     $this->ZONE_COUNT = min( $this->zonesArea->size / self::ZONE_SIZE );
   }
@@ -374,7 +409,7 @@ class MemoryBlock {
       $zoneMeta = $this->getZoneMetaByIndex( $i );
       $zoneMeta->usedspace = 0;
 
-      $chunk = $this->getChunkByOffset( $i * self::ZONE_SIZE + self::ZONE_META_SIZE );
+      $chunk = $this->getChunkByOffset( $i * self::ZONE_SIZE + $zoneMeta->_size );
       $chunk->key = '';
       $chunk->hashnext = 0;
       $chunk->valallocsize = $this->MAX_CHUNK_SIZE - $this->CHUNK_META_SIZE;
@@ -423,73 +458,14 @@ class MemoryBlock {
 
   private function setOldestZoneIndex( $index ) {
 
+    if ( $index > $this->ZONE_COUNT - 1 )
+      $index = 0;
+
     $data = pack( 'l', $index );
     $ret = shmop_write( $this->shm, $data, $this->metaArea->startOffset + $this->LONG_SIZE );
 
     if ( $ret === false ) {
       trigger_error( 'Could not write the oldest zone index' );
-      return false;
-    }
-
-    return true;
-  }
-
-  private function getGetHits() {
-
-    $data = shmop_read(
-      $this->shm,
-      $this->statsArea->startOffset,
-      $this->LONG_SIZE
-    );
-
-    if ( $data === false ) {
-      trigger_error( 'Could not read the get() hit count' );
-      return null;
-    }
-
-    return unpack( 'l', $data )[ 1 ];
-  }
-
-  private function getGetMisses() {
-
-    $data = shmop_read(
-      $this->shm,
-      $this->statsArea->startOffset + $this->LONG_SIZE,
-      $this->LONG_SIZE
-    );
-
-    if ( $data === false ) {
-      trigger_error( 'Could not read the get() miss count' );
-      return null;
-    }
-
-    return unpack( 'l', $data )[ 1 ];
-  }
-
-  private function setGetHits( $count ) {
-
-    if ( $count < 0 ) {
-      trigger_error( 'get() hit count must be 0 or larger' );
-      return false;
-    }
-
-    if ( shmop_write( $this->shm, pack( 'l', $count ), $this->statsArea->startOffset ) === false ) {
-      trigger_error( 'Could not write the get() hit count' );
-      return false;
-    }
-
-    return true;
-  }
-
-  private function setGetMisses( $count ) {
-
-    if ( $count < 0 ) {
-      trigger_error( 'get() miss count must be 0 or larger' );
-      return false;
-    }
-
-    if ( shmop_write( $this->shm, pack( 'l', $count ), $this->statsArea->startOffset + $this->LONG_SIZE ) === false ) {
-      trigger_error( 'Could not write the get() miss count' );
       return false;
     }
 
@@ -509,24 +485,12 @@ class MemoryBlock {
     return true;
   }
 
-  // TODO
-  private function getNextItemOffset( $itemOffset, $itemValAllocSize ) {
-
-    $nextItemOffset = $itemOffset + $this->CHUNK_META_SIZE + $itemValAllocSize;
-    // If it's the last item in the zones area, the next item's offset is 0,
-    // which means "none"
-    if ( $nextItemOffset > $this->LAST_ITEM_MAX_OFFSET )
-      $nextItemOffset = 0;
-
-    return $nextItemOffset;
-  }
-
   private function findHashTablePrevChunkOffset( ShmBackedObject $chunk, $bucketIndex ) {
 
     $chunkOffset = $chunk->_startOffset;
     $currentOffset = $this->getBucketHeadChunkOffset( $bucketIndex );
 
-    while ( $currentOffset >= 0 ) {
+    while ( $currentOffset ) {
       $testChunk = $this->getChunkByOffset( $currentOffset );
       $nextOffset = $testChunk->hashnext;
       if ( $nextOffset == $chunkOffset )
@@ -534,7 +498,7 @@ class MemoryBlock {
       $currentOffset = $nextOffset;
     }
 
-    return -1;
+    return 0;
   }
 
   /**
@@ -549,15 +513,9 @@ class MemoryBlock {
    */
   private function getBucketIndex( $key ) {
 
-    $hash = hash( 'crc32', $key, true );
-
     // Read as a 32-bit unsigned long
     // TODO: unpack() is slow. Is there an alternative?
-    $index = unpack( 'L', $hash )[ 1 ];
-    // Modulo by the amount of hash table buckets to get an array index
-    $index %= self::HASH_BUCKET_COUNT;
-
-    return $index;
+    return unpack( 'L', hash( 'crc32', $key, true ) )[ 1 ] % self::HASH_BUCKET_COUNT;
   }
 
   /**
@@ -571,12 +529,9 @@ class MemoryBlock {
       $this->LONG_SIZE
     );
 
-    if ( !$headChunkOffset )
-      return -1;
-
     if ( $data === false ) {
       trigger_error( 'Could not read head chunk offset for bucket "'. $index .'"' );
-      return -1;
+      return 0;
     }
 
     return unpack( 'l', $data )[ 1 ];
@@ -586,7 +541,6 @@ class MemoryBlock {
 
     $hashTableOffset = $this->KEYS_START + $hashTableIndex * $this->LONG_SIZE;
     $data = pack( 'l', $itemMetaOffset );
-
     $ret = shmop_write( $this->shm, $data, $hashTableOffset );
 
     if ( $ret === false ) {
@@ -597,33 +551,71 @@ class MemoryBlock {
     return true;
   }
 
+  private function linkChunkToHashTable( ShmBackedObject $chunk ) {
+
+    $bucketIndex = $this->getBucketIndex( $chunk->key );
+    $existingChunkOffset = $this->getBucketHeadChunkOffset( $bucketIndex );
+
+    if ( !$existingChunkOffset )
+      return $this->setBucketHeadChunkOffset( $bucketIndex, $chunk->_startOffset );
+
+    while ( $existingChunkOffset ) {
+      $existingChunk = $this->getChunkByOffset( $existingChunkOffset );
+      if ( !$existingChunk->hashnext ) {
+        $existingChunk->hashnext = $chunk->_startOffset;
+        return true;
+      }
+      $existingChunkOffset = $existingChunk->hashnext;
+    }
+
+    return false;
+  }
+
   private function unlinkChunkFromHashTable( ShmBackedObject $chunk ) {
 
     $bucketIndex = $this->getBucketIndex( $chunk->key );
     $bucketHeadChunkOffset = $this->getBucketHeadChunkOffset( $bucketIndex );
 
-    if ( $bucketHeadChunkOffset < 0 ) {
+    if ( !$bucketHeadChunkOffset ) {
       trigger_error( 'Key "'. rawurlencode( $chunk->key ) .'"\'s bucket is empty' );
       return false;
     }
 
-
-    if ( $chunk->_startOffset === $bucketHeadChunkOffset ) {
+    if ( $chunk->_startOffset === $bucketHeadChunkOffset )
       return $this->setBucketHeadChunkOffset( $bucketIndex, $chunk->hashnext );
-    }
 
     $prevChunkOffset = $this->findHashTablePrevChunkOffset( $chunk, $bucketIndex );
-    if ( $prevChunkOffset < 0 )
+    if ( !$prevChunkOffset )
       return false;
 
-    $chunk = $this->getChunkByOffset( $chunkOffset );
     $prevChunk = $this->getChunkByOffset( $prevChunkOffset );
 
-    //              ________________
-    //             |                v
-    // Link prevChunk currentChunk nextChunk
+    //               ________________
+    //              |                v
+    // Link [prevChunk currentChunk nextChunk]
     //
     $prevChunk->hashnext = $chunk->hashnext;
+    $chunk->hashnext = 0;
+
+    return true;
+  }
+
+  private function mergeChunkWithNextFreeChunks( ShmBackedObject $chunk ) {
+
+    $newAllocSize = $origAllocSize = $chunk->valallocsize;
+    $nextChunkOffset = $chunk->_endOffset + $origAllocSize;
+
+    while ( $nextChunkOffset ) {
+      $nextChunk = $this->getChunkByOffset( $nextChunkOffset );
+      // Found a non-free chunk
+      if ( $nextChunk->valsize )
+        break;
+      $newAllocSize += $nextChunk->_size + $nextChunk->valallocsize;
+      $nextChunkOffset = $nextChunkOffset + $nextChunk->_size + $nextChunk->valallocsize;
+    }
+
+    if ( $newAllocSize !== $origAllocSize )
+      $chunk->valallocsize = $newAllocSize;
 
     return true;
   }
