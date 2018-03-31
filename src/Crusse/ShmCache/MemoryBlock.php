@@ -85,6 +85,9 @@ class MemoryBlock {
   public $hashBucketArea;
   public $zonesArea;
 
+  private $oldestZoneIndexLock;
+  private $zoneLock;
+
   private $statsProto;
   private $zoneMetaProto;
   private $chunkProto;
@@ -128,6 +131,8 @@ class MemoryBlock {
       $this->clearMemBlockToInitialData();
 
     $this->initializeShmObjectPrototypes();
+
+    $this->oldestZoneIndexLock = new ShmCache\Lock( 'oldestzoneindex' );
   }
 
   private function initializeShmObjectPrototypes() {
@@ -188,13 +193,15 @@ class MemoryBlock {
       shmop_close( $this->shm );
   }
 
+  /**
+   * You must hold a bucket lock when calling this.
+   */
   function getChunkByOffset( $chunkOffset ) {
     return $this->chunkProto->createInstance( $chunkOffset );
   }
 
   /**
-   * Returns an offset in the zones area, to the chunk whose key matches
-   * the given key.
+   * You must hold a bucket lock when calling this.
    */
   function getChunkByKey( $key ) {
 
@@ -206,7 +213,7 @@ class MemoryBlock {
       $chunk = $this->getChunkByOffset( $chunkOffset );
 
       if ( $chunk->key === $key )
-        return $chunkOffset;
+        return $chunk;
 
       $chunkOffset = $chunk->hashnext;
     }
@@ -214,6 +221,9 @@ class MemoryBlock {
     return null;
   }
 
+  /**
+   * You must hold a bucket lock when calling this.
+   */
   function removeChunk( ShmBackedObject $chunk ) {
 
     $chunkValAllocSize = $chunk->valallocsize;
@@ -241,6 +251,40 @@ class MemoryBlock {
     return true;
   }
 
+  /**
+   * Split the chunk into two, if the difference between valsize and
+   * valallocsize is large enough.
+   *
+   * You must hold a bucket lock when calling this.
+   */
+  function splitChunkForFreeSpace( ShmBackedObject $chunk ) {
+
+    $leftOverSize = $chunk->valallocsize - $chunk->valsize;
+
+    if ( $leftOverSize >= $this->CHUNK_META_SIZE + self::MIN_VALUE_ALLOC_SIZE ) {
+
+      $leftOverChunkOffset = $chunk->_endOffset + $chunk->valsize;
+      $leftOverChunkValAllocSize = $leftOverSize - $this->CHUNK_META_SIZE;
+
+      $leftOverChunk = $this->getChunkByOffset( $leftOverChunkOffset );
+      $leftOverChunk->key = '';
+      $leftOverChunk->hashnext = 0;
+      $leftOverChunk->valallocsize = $leftOverChunkValAllocSize;
+      $leftOverChunk->valsize = 0;
+      $leftOverChunk->flags = 0;
+
+      $chunk->valallocsize -= $leftOverSize;
+
+      if ( !$this->mergeChunkWithNextFreeChunks( $leftOverChunk ) )
+        return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * You must hold the zone's lock when calling this.
+   */
   function getZoneMetaByIndex( $zoneIndex ) {
     return $this->zoneMetaProto->createInstance( $zoneIndex * self::ZONE_SIZE );
   }
@@ -432,7 +476,7 @@ class MemoryBlock {
     $this->shm = null;
   }
 
-  private function getNewestZoneIndex() {
+  function getNewestZoneIndex() {
 
     // TODO: oldestZoneIndexLock
     $index = $this->getOldestZoneIndex() - 1;
@@ -443,7 +487,7 @@ class MemoryBlock {
     return $index;
   }
 
-  private function getOldestZoneIndex() {
+  function getOldestZoneIndex() {
 
     $data = shmop_read( $this->shm, $this->metaArea->startOffset + $this->LONG_SIZE, $this->LONG_SIZE );
     $index = unpack( 'l', $data )[ 1 ];
@@ -456,7 +500,7 @@ class MemoryBlock {
     return $index;
   }
 
-  private function setOldestZoneIndex( $index ) {
+  function setOldestZoneIndex( $index ) {
 
     if ( $index > $this->ZONE_COUNT - 1 )
       $index = 0;
@@ -472,10 +516,19 @@ class MemoryBlock {
     return true;
   }
 
-  /**
-   * @param int $chunkOffset Relative to the zone area start
-   */
-  private function writeChunkValue( ShmBackedObject $chunk, $value ) {
+  function getChunkValue( ShmBackedObject $chunk ) {
+
+    $data = shmop_read( $chunk->_shm, $chunk->_endOffset, $chunk->valsize );
+
+    if ( $data === false ) {
+      trigger_error( 'Could not read chunk value' );
+      return false;
+    }
+
+    return $data;
+  }
+
+  function setChunkValue( ShmBackedObject $chunk, $value ) {
 
     if ( shmop_write( $chunk->_shm, $value, $chunk->_startOffset + $this->CHUNK_META_SIZE ) === false ) {
       trigger_error( 'Could not write chunk value' );
@@ -483,6 +536,65 @@ class MemoryBlock {
     }
 
     return true;
+  }
+
+  function writeNewChunk( $key, $value, $valueSize, $valueIsSerialized ) {
+
+    if ( $valueSize > $this->MAX_CHUNK_SIZE ) {
+      trigger_error( 'Item "'. rawurlencode( $key ) .'" is too large ('. round( $valueSize / 1000, 2 ) .' KB) to cache' );
+      goto error;
+    }
+
+    // TODO: oldestZoneIndexLock
+    $newestZoneIndex = $this->getNewestZoneIndex();
+    if ( $newestZoneIndex < 0 )
+      goto error;
+
+    // TODO: zone lock
+    $zoneMeta = $this->getZoneMetaByIndex( $newestZoneIndex );
+    $zoneFreeSpace = $this->getZoneFreeSpace( $zoneMeta );
+
+    // The new value doesn't fit into the oldest zone. Make space for the new
+    // value by evicting all chunks in the oldest zone.
+    if ( $zoneFreeSpace < $valueSize ) {
+
+      // TODO: oldestZoneIndexLock
+      $oldestZoneIndex = $this->getOldestZoneIndex();
+      if ( $oldestZoneIndex < 0 )
+        goto error;
+
+      $zoneMeta = $this->getZoneMetaByIndex( $oldestZoneIndex );
+      if ( !$this->removeAllChunksInZone( $zoneMeta ) )
+        goto error;
+
+      $this->setOldestZoneIndex( $oldestZoneIndex + 1 );
+    }
+
+    $flags = 0;
+    if ( $valueIsSerialized )
+      $flags |= self::FLAG_SERIALIZED;
+
+    $freeChunk = $this->getChunkByOffset( $this->getZoneFreeChunkOffset( $zoneMeta ) );
+    $freeChunk->key = $key;
+    $freeChunk->valsize = $valueSize;
+    $freeChunk->flags = $flags;
+
+    if ( !$this->setChunkValue( $freeChunk, $value ) )
+      goto error;
+
+    if ( !$this->linkChunkToHashTable( $freeChunk ) )
+      goto error;
+
+    if ( !$this->splitChunkForFreeSpace( $freeChunk ) )
+      goto error;
+
+    $zoneMeta->usedspace += $freeChunk->_size + $freeChunk->valallocsize;
+
+    success:
+    return true;
+
+    error:
+    return false;
   }
 
   private function findHashTablePrevChunkOffset( ShmBackedObject $chunk, $bucketIndex ) {

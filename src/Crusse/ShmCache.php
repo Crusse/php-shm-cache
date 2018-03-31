@@ -27,13 +27,10 @@ namespace Crusse;
 class ShmCache {
 
   const FLAG_SERIALIZED = 0b00000001;
-  const FLAG_MUST_FREE = 0b00000010;
 
   private $memAllocLock;
   private $statsLock;
-  private $oldestZoneIndexLock;
   private $hashBucketLocks = [];
-  private $zoneLocks = [];
 
   private $getHits = 0;
   private $getMisses = 0;
@@ -57,7 +54,6 @@ class ShmCache {
 
     $this->memAllocLock = new ShmCache\Lock( 'memalloc' );
     $this->statsLock = new ShmCache\Lock( 'stats' );
-    $this->oldestZoneIndexLock = new ShmCache\Lock( 'oldestzoneindex' );
 
     if ( !$this->memAllocLock->getWriteLock() )
       throw new \Exception( 'Could not get a lock' );
@@ -84,13 +80,16 @@ class ShmCache {
     $key = $this->sanitizeKey( $key );
     $value = $this->maybeSerialize( $value, $retIsSerialized );
 
-    $this->memAllocLock->getReadLock();
+    if ( !$this->memAllocLock->getReadLock() )
+      return false;
 
     $lock = $this->getHashBucketLock( $key );
-    $lock->getWriteLock();
-    $ret = $this->_set( $key, $value, $retIsSerialized );
-    $lock->releaseLock();
+    if ( !$lock->getWriteLock() )
+      return false;
 
+    $ret = $this->_set( $key, $value, $retIsSerialized );
+
+    $lock->releaseLock();
     $this->memAllocLock->releaseLock();
 
     return $ret;
@@ -103,13 +102,16 @@ class ShmCache {
 
     $key = $this->sanitizeKey( $key );
 
-    $this->memAllocLock->getReadLock();
+    if ( !$this->memAllocLock->getReadLock() )
+      return false;
 
     $lock = $this->getHashBucketLock( $key );
-    $lock->getReadLock();
-    $ret = $this->_get( $key, $retIsSerialized, $retIsCacheHit );
-    $lock->releaseLock();
+    if ( !$lock->getReadLock() )
+      return false;
 
+    $ret = $this->_get( $key, $retIsSerialized, $retIsCacheHit );
+
+    $lock->releaseLock();
     $this->memAllocLock->releaseLock();
 
     if ( $ret && $retIsSerialized )
@@ -130,13 +132,16 @@ class ShmCache {
 
     $key = $this->sanitizeKey( $key );
 
-    $this->memAllocLock->getReadLock();
+    if ( !$this->memAllocLock->getReadLock() )
+      return false;
 
     $lock = $this->getHashBucketLock( $key );
-    $lock->getReadLock();
-    $ret = ( $this->getChunkOffset( $key ) > -1 );
-    $lock->releaseLock();
+    if ( !$lock->getReadLock() )
+      return false;
 
+    $ret = (bool) $this->getChunkByKey( $key );
+
+    $lock->releaseLock();
     $this->memAllocLock->releaseLock();
 
     return $ret;
@@ -150,18 +155,16 @@ class ShmCache {
     $key = $this->sanitizeKey( $key );
     $value = $this->maybeSerialize( $value, $retIsSerialized );
 
-    $this->memAllocLock->getReadLock();
+    if ( !$this->memAllocLock->getReadLock() )
+      return false;
 
     $lock = $this->getHashBucketLock( $key );
-    $lock->getWriteLock();
+    if ( !$lock->getWriteLock() )
+      return false;
 
-    if ( $this->getChunkOffset( $key ) > -1 )
-      $ret = false;
-    else
-      $ret = $this->_set( $key, $value, $retIsSerialized );
+    $ret = $this->_set( $key, $value, $retIsSerialized, true );
 
     $lock->releaseLock();
-
     $this->memAllocLock->releaseLock();
 
     return $ret;
@@ -175,18 +178,16 @@ class ShmCache {
     $key = $this->sanitizeKey( $key );
     $value = $this->maybeSerialize( $value, $retIsSerialized );
 
-    $this->memAllocLock->getReadLock();
+    if ( !$this->memAllocLock->getReadLock() )
+      return false;
 
     $lock = $this->getHashBucketLock( $key );
-    $lock->getWriteLock();
+    if ( !$lock->getWriteLock() )
+      return false;
 
-    if ( $this->getChunkOffset( $key ) < 0 )
-      $ret = false;
-    else
-      $ret = $this->_set( $key, $value, $retIsSerialized );
+    $ret = $this->_set( $key, $value, $retIsSerialized, false, true );
 
     $lock->releaseLock();
-
     $this->memAllocLock->releaseLock();
 
     return $ret;
@@ -216,7 +217,7 @@ class ShmCache {
       $value = $initialValue;
     }
     else if ( !is_numeric( $value ) ) {
-      trigger_error( 'Item '. $key .' is not numeric' );
+      trigger_error( 'Item "'. $key .'" value is not numeric' );
       $lock->releaseLock();
       return false;
     }
@@ -226,7 +227,6 @@ class ShmCache {
     $success = $this->_set( $key, $valueSerialized, $retIsSerialized );
 
     $lock->releaseLock();
-
     $this->memAllocLock->releaseLock();
 
     if ( $success )
@@ -257,28 +257,18 @@ class ShmCache {
     if ( !$lock->getWriteLock() )
       return false;
 
-    $index = $this->getChunkOffset( $key );
     $ret = false;
+    $chunk = $this->getChunkByKey( $key );
 
-    if ( $index >= 0 ) {
-
-      $metaOffset = $this->getItemMetaOffsetByHashTableIndex( $index );
-
-      if ( $metaOffset > 0 ) {
-
-        $item = $this->getChunkByOffset( $metaOffset );
-
-        if ( $item ) {
-          if ( !$item[ 'valsize' ] )
-            $ret = true;
-          else
-            $ret = $this->removeChunk( $key, $metaOffset );
-        }
-      }
+    if ( $chunk ) {
+      // Already free
+      if ( !$chunk->valsize )
+        $ret = true;
+      else
+        $ret = $this->removeChunk( $chunk );
     }
 
     $lock->releaseLock();
-
     $this->memAllocLock->releaseLock();
 
     return $ret;
@@ -412,139 +402,74 @@ class ShmCache {
 
   private function _get( $key, &$retIsSerialized, &$retIsCacheHit ) {
 
-    $index = $this->getChunkOffset( $key );
     $ret = false;
     $retIsCacheHit = false;
     $retIsSerialized = false;
+    $chunk = $this->getChunkByKey( $key );
 
-    if ( $index >= 0 ) {
+    if ( $chunk ) {
 
-      $metaOffset = $this->getItemMetaOffsetByHashTableIndex( $index );
+      $data = $this->getChunkValue( $chunk );
 
-      if ( $metaOffset > 0 ) {
-
-        $item = $this->getChunkByOffset( $metaOffset );
-
-        if ( $item ) {
-
-          $data = shmop_read( $this->shm, $metaOffset + $this->CHUNK_META_SIZE, $item[ 'valsize' ] );
-
-          if ( $data === false ) {
-            trigger_error( 'Could not read value for item "'. rawurlencode( $key ) .'"' );
-          }
-          else {
-            $retIsSerialized = $item[ 'flags' ] & self::FLAG_SERIALIZED;
-            $retIsCacheHit = true;
-            $ret = $data;
-          }
-        }
+      if ( $data === false ) {
+        trigger_error( 'Could not read value for item "'. rawurlencode( $key ) .'"' );
+      }
+      else {
+        $retIsSerialized = $chunk->flags & self::FLAG_SERIALIZED;
+        $retIsCacheHit = true;
+        $ret = $data;
       }
     }
 
     return $ret;
   }
 
-  private function _set( $key, $value, $valueIsSerialized ) {
+  /**
+   * Note: whenever we cannot store the value to the cache, we remove any
+   * existing item with the same key (in removeChunk() above). This emulates Memcached:
+   * https://github.com/memcached/memcached/wiki/Performance#how-it-handles-set-failures
+   */
+  private function _set( $key, $value, $valueIsSerialized, $mustNotExist = false, $mustExist = false ) {
 
-    $newValueSize = strlen( $value );
+    $valueSize = strlen( $value );
     $existingChunk = $this->getChunkByKey( $key );
 
     if ( $existingChunk ) {
 
+      if ( $mustNotExist )
+        goto error;
+
       // There's enough space for the new value in the existing chunk.
       // Replace the value in-place.
-      if ( $newValueSize <= $existingChunk->valallocsize ) {
+      if ( $valueSize <= $existingChunk->valallocsize ) {
 
         $flags = 0;
         if ( $valueIsSerialized )
           $flags |= self::FLAG_SERIALIZED;
 
-        $existingChunk->valsize = $newValueSize;
+        $existingChunk->valsize = $valueSize;
         $existingChunk->flags = $flags;
 
-        if ( !$this->writeChunkValue( $chunk->_startOffset, $value ) )
+        if ( !$this->setChunkValue( $chunk->_startOffset, $value ) )
           goto error;
 
         goto success;
       }
-      // The new value is too large to fit into the existing item's spot, and
-      // would overwrite 1 or more items to the right of it. We'll instead
-      // remove the existing item, and handle this as a new value, so that this
-      // item will replace 1 or more of the _oldest_ items (that are pointed to
-      // by the ring buffer pointer).
+      // The new value is too large to fit into the existing chunk, and
+      // would overwrite 1 or more chunks to the right of it. We'll instead
+      // remove the existing chunk, and handle this as a new value.
       else {
         if ( !$this->removeChunk( $existingChunk ) )
           goto error;
       }
     }
-
-    // Note: whenever we cannot store the value to the cache, we remove any
-    // existing item with the same key (in removeChunk() above). This emulates Memcached:
-    // https://github.com/memcached/memcached/wiki/Performance#how-it-handles-set-failures
-    if ( $newValueSize > $this->MAX_CHUNK_SIZE ) {
-      trigger_error( 'Item "'. rawurlencode( $key ) .'" is too large ('. round( $newValueSize / 1000, 2 ) .' KB) to cache' );
-      goto error;
-    }
-
-    $newestZoneIndex = $this->getNewestZoneIndex();
-    if ( $newestZoneIndex < 0 )
-      goto error;
-
-    $zoneMeta = $this->getZoneMetaByIndex( $newestZoneIndex );
-    $zoneFreeSpace = $this->getZoneFreeSpace( $zoneMeta );
-
-    // The new value doesn't fit into the oldest zone. Make space for the new
-    // value by evicting all chunks in the oldest zone.
-    if ( $zoneFreeSpace < $newValueSize ) {
-
-      // TODO: oldestZoneIndexLock
-      $oldestZoneIndex = $this->getOldestZoneIndex();
-      if ( $oldestZoneIndex < 0 )
+    else {
+      if ( $mustExist )
         goto error;
-
-      $zoneMeta = $this->getZoneMetaByIndex( $oldestZoneIndex );
-      if ( !$this->removeAllChunksInZone( $zoneMeta ) )
-        goto error;
-
-      $this->setOldestZoneIndex( $oldestZoneIndex + 1 );
     }
 
-    $leftOverSize = $zoneFreeSpace - $newValueSize;
-    $freeChunk = $this->getChunkByOffset( $this->getZoneFreeChunkOffset( $zoneMeta ) );
-
-    // TODO TODO TODO
-
-    // Split the chunk into two, if there is enough space left over
-    if ( $leftOverSize >= $this->CHUNK_META_SIZE + self::MIN_VALUE_ALLOC_SIZE ) {
-
-      $leftOverChunkOffset = $freeChunk->_endOffset + $newValueSize;
-      $leftOverChunkValAllocSize = $leftOverSize - $this->CHUNK_META_SIZE;
-
-      $leftOverChunk = $this->getChunkByOffset( $leftOverChunkOffset );
-      $leftOverChunk->key = '';
-      $leftOverChunk->hashnext = 0;
-      $leftOverChunk->valallocsize = $this->MAX_CHUNK_SIZE - $this->CHUNK_META_SIZE;
-      $leftOverChunk->valsize = 0;
-      $leftOverChunk->flags = 0;
-
-      $freeChunk->valallocsize -= $leftOverSize;
-    }
-
-    $flags = 0;
-    if ( $valueIsSerialized )
-      $flags |= self::FLAG_SERIALIZED;
-
-    $freeChunk->key = $key;
-    $freeChunk->valsize = $newValueSize;
-    $freeChunk->flags = $flags;
-
-    if ( !$this->writeChunkValue( $freeChunk, $value ) )
+    if ( !$this->memory->writeNewChunk( $key, $value, $valueSize, $valueIsSerialized ) )
       goto error;
-
-    if ( !$this->linkChunkToHashTable( $freeChunk ) )
-      goto error;
-
-    $zoneMeta->usedspace += $freeChunk->_size + $freeChunk->valallocsize;
 
     success:
     return true;

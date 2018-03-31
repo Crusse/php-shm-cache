@@ -841,7 +841,7 @@ We have these locks:
 - Each zone has its own lock
 - Ring buffer pointer lock
 
-Example steps when hen trying to update an item in bucket A and in zone X with
+Example steps when trying to update an item in bucket A and in zone X with
 a new value, and the existing chunk doesn't have enough space for it:
 
 - Lock bucket A and zone X
@@ -923,7 +923,7 @@ read an existing item.
 - P2: UNLOCK zone Y
 - P2: UNLOCK bucket B
 
-RULE 3: the lock order between a bucket and a zone lock must always be
+RULE 3: the lock order between a bucket and a zone lock must be
 bucket->zone, not zone->bucket. For ringBufferPtr it's ringBufferPtr->zone.
 So, lock order:
 Bucket lock -> ringBufferPtr lock -> zone lock
