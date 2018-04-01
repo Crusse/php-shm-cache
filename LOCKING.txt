@@ -1308,5 +1308,47 @@ Generic stuff I've learned so far:
   What _is_ a resource? A single "resource" might contain data in multiple places.
 
 
+##############################################################################
+#                     No zone locks? Only bucket locks?                      #
+##############################################################################
+
+Hash table        _A__ _B__
+buckets         1|____|____|5______
+             _2____|    ^          |6
+            |           |___4__    |
+Entry  |____v__ ______|________|_ _v_|
+zones  |_______|______|__________|___|
+       |Zone|X        |Zone Y  ^   ^ |
+            |         ^        |   |
+            |         |        |   |
+            |    ringBufferPtr |   |7
+            |__________________|___|
+                      3
+
+1 P1: Lock bucket A
+- P1: Read head chunk offset from bucket A
+2 P1: Free chunk from zone X
+3 P1: Evict zone Y to make free space for chunk's (now-oversized) value
+- P1: Read zone Y's first chunk's key
+  - Race condition: someone might be writing to the key, and you might read
+    partially old data and partially new data from the key string
+4 P1: Lock bucket B
+- P1: Unlink first chunk from bucket B
+- P1: Free first chunk of zone Y
+- P1: Unlock bucket B
+- P1: Read zone Y's second chunk's key
+  - Race condition: someone might be writing to the key, and you might read
+    partially old data and partially new data from the key string
+5 P2: Lock bucket B
+- P2: Read head chunk offset from bucket B
+6 P2: Unlink second chunk from bucket B
+- P2: Free second chunk of zone Y
+- P2: Unlock bucket B
+7 P1: Lock zone Y's second chunk's bucket (B)
+- P1: Free second chunk of zone Y
+  - Problem: already freed by P2
+
+We'll want to use zone locks because of the race condition and the
+already-freed problem.
 
 

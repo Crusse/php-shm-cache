@@ -424,11 +424,6 @@ class ShmCache {
     return $ret;
   }
 
-  /**
-   * Note: whenever we cannot store the value to the cache, we remove any
-   * existing item with the same key (in removeChunk() above). This emulates Memcached:
-   * https://github.com/memcached/memcached/wiki/Performance#how-it-handles-set-failures
-   */
   private function _set( $key, $value, $valueIsSerialized, $mustNotExist = false, $mustExist = false ) {
 
     $valueSize = strlen( $value );
@@ -437,45 +432,32 @@ class ShmCache {
     if ( $existingChunk ) {
 
       if ( $mustNotExist )
-        goto error;
+        return false;
 
-      // There's enough space for the new value in the existing chunk.
-      // Replace the value in-place.
-      if ( $valueSize <= $existingChunk->valallocsize ) {
-
-        $flags = 0;
-        if ( $valueIsSerialized )
-          $flags |= self::FLAG_SERIALIZED;
-
-        $existingChunk->valsize = $valueSize;
-        $existingChunk->flags = $flags;
-
-        if ( !$this->setChunkValue( $chunk->_startOffset, $value ) )
-          goto error;
-
-        goto success;
+      if ( $this->replaceChunkValue( $existingChunk, $value, $valueSize, $valueIsSerialized ) ) {
+        return true;
       }
-      // The new value is too large to fit into the existing chunk, and
-      // would overwrite 1 or more chunks to the right of it. We'll instead
-      // remove the existing chunk, and handle this as a new value.
       else {
+        // The new value is probably too large to fit into the existing chunk, and
+        // would overwrite 1 or more chunks to the right of it. We'll instead
+        // remove the existing chunk, and handle this as a new value.
+        //
+        // Note: whenever we cannot store the value to the cache, we remove any
+        // existing item with the same key. This emulates Memcached:
+        // https://github.com/memcached/memcached/wiki/Performance#how-it-handles-set-failures
         if ( !$this->removeChunk( $existingChunk ) )
-          goto error;
+          return false;
       }
     }
     else {
       if ( $mustExist )
-        goto error;
+        return false;
     }
 
-    if ( !$this->memory->writeNewChunk( $key, $value, $valueSize, $valueIsSerialized ) )
-      goto error;
+    if ( !$this->memory->addChunk( $key, $value, $valueSize, $valueIsSerialized ) )
+      return false;
 
-    success:
     return true;
-
-    error:
-    return false;
   }
 
   private function sanitizeKey( $key ) {
