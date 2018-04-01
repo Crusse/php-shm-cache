@@ -241,36 +241,36 @@ class MemoryBlock {
    */
   function removeChunk( ShmBackedObject $chunk ) {
 
+    if ( !$this->unlinkChunkFromHashTable( $chunk ) )
+      return false;
+
     $lock = $this->getZoneLock( $this->getZoneIndexForChunk( $chunk ) );
     if ( !$lock->getWriteLock() )
       return false;
 
+    if ( !$this->mergeChunkWithNextFreeChunks( $chunk ) )
+      goto cleanup;
+
     $ret = false;
+
+    $zoneMeta = $this->getZoneMetaForChunk( $chunk );
 
     $chunkValAllocSize = $chunk->valallocsize;
     $chunkTotalSize = $chunk->_size + $chunkValAllocSize;
     $nextChunkOffset = $chunk->_endOffset + $chunkValAllocSize;
-
-    $chunk->valsize = 0;
-    $lock->releaseLock();
-
-    if ( !$this->unlinkChunkFromHashTable( $chunk ) )
-      goto cleanup;
-
-    if ( !$this->mergeChunkWithNextFreeChunks( $chunk ) )
-      goto cleanup;
-
-    $zoneMeta = $this->getZoneMetaForChunk( $chunk );
-
-    if ( !$zoneMeta )
-      goto cleanup;
 
     // This is the top chunk in the zone's chunk stack. Adjust the zone's chunk
     // stack pointer.
     if ( $this->getZoneFreeChunkOffset( $zoneMeta ) === $nextChunkOffset )
       $zoneMeta->usedspace -= $chunkTotalSize;
 
+    // Free the chunk
+    $chunk->valsize = 0;
+
     $ret = true;
+
+    cleanup:
+    $lock->releaseLock();
 
     return $ret;
   }
@@ -336,6 +336,12 @@ class MemoryBlock {
    */
   function splitChunkForFreeSpace( ShmBackedObject $chunk ) {
 
+    $lock = $this->getZoneLock( $this->getZoneIndexForChunk( $chunk ) );
+    if ( !$lock->getWriteLock() )
+      return false;
+
+    $ret = false;
+
     $leftOverSize = $chunk->valallocsize - $chunk->valsize;
 
     if ( $leftOverSize >= $this->CHUNK_META_SIZE + self::MIN_VALUE_ALLOC_SIZE ) {
@@ -353,10 +359,15 @@ class MemoryBlock {
       $chunk->valallocsize -= $leftOverSize;
 
       if ( !$this->mergeChunkWithNextFreeChunks( $leftOverChunk ) )
-        return false;
+        goto cleanup;
     }
 
-    return true;
+    $ret = true;
+
+    cleanup:
+    $lock->releaseLock();
+
+    return $ret;
   }
 
   /**
@@ -381,6 +392,9 @@ class MemoryBlock {
     return $this->MAX_CHUNK_SIZE - $zoneMeta->usedspace;
   }
 
+  /**
+   * You must hold a zone lock when calling this.
+   */
   function getZoneFreeChunkOffset( ShmBackedObject $zoneMeta ) {
     return $zoneMeta->_endOffset + $zoneMeta->usedspace;
   }
@@ -783,18 +797,28 @@ class MemoryBlock {
   }
 
   /**
-   * You must hold a bucket lock when calling this.
+   * Increases the chunk's valallocsize.
+   *
+   * You must hold a bucket lock and a zone lock when calling this.
    */
   private function mergeChunkWithNextFreeChunks( ShmBackedObject $chunk ) {
+
+    $zoneIndex = $this->getZoneIndexForChunk( $chunk );
 
     $newAllocSize = $origAllocSize = $chunk->valallocsize;
     $nextChunkOffset = $chunk->_endOffset + $origAllocSize;
 
     while ( $nextChunkOffset ) {
+
       $nextChunk = $this->getChunkByOffset( $nextChunkOffset );
+
+      if ( $this->getZoneIndexForChunk( $nextChunk ) !== $zoneIndex )
+        break;
+
       // Found a non-free chunk
       if ( $nextChunk->valsize )
         break;
+
       $newAllocSize += $nextChunk->_size + $nextChunk->valallocsize;
       $nextChunkOffset = $nextChunkOffset + $nextChunk->_size + $nextChunk->valallocsize;
     }
@@ -803,6 +827,11 @@ class MemoryBlock {
       $chunk->valallocsize = $newAllocSize;
 
     return true;
+  }
+
+  private function getZoneLock( $zoneIndex ) {
+    // TODO: throw an exception if trying to get a zone lock when a zone lock
+    // has already been acquired and not released
   }
 }
 
