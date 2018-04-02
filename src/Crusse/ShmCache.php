@@ -28,6 +28,7 @@ class ShmCache {
 
   private $memory;
   private $locks;
+  private $stats;
 
   /**
    * @param $desiredSize The size of the shared memory block, which will contain all ShmCache data. If a block already exists and its size is larger, the block's size will not be reduced. If its size is smaller, it will be enlarged.
@@ -46,13 +47,13 @@ class ShmCache {
 
     $this->locks = new ShmCache\LockManager();
 
-    if ( !$this->lock->everything->getWriteLock() )
+    if ( !$this->lock->everything->lockForWrite() )
       throw new \Exception( 'Could not get a lock' );
 
     $this->memory = new ShmCache\MemoryBlock( $desiredSize );
     $this->stats = new ShmCache\Stats( $this->memory, $this->locks );
 
-    if ( !$this->locks->everything->releaseWriteLock() )
+    if ( !$this->locks->everything->releaseWrite() )
       throw new \Exception( 'Could not release a lock' );
   }
 
@@ -71,17 +72,17 @@ class ShmCache {
     $key = $this->sanitizeKey( $key );
     $value = $this->maybeSerialize( $value, $retIsSerialized );
 
-    if ( !$this->locks->everything->getReadLock() )
+    if ( !$this->locks->everything->lockForRead() )
       return false;
 
-    $bucketLock = $this->locks->bucketLock( $this->getBucketIndex( $key ) );
-    if ( !$bucketLock->getWriteLock() )
+    $bucketLock = $this->locks->getBucketLock( $this->memory->getBucketIndex( $key ) );
+    if ( !$bucketLock->lockForWrite() )
       return false;
 
     $ret = $this->_set( $key, $value, $retIsSerialized );
 
-    $bucketLock->releaseWriteLock();
-    $this->locks->everything->releaseReadLock();
+    $bucketLock->releaseWrite();
+    $this->locks->everything->releaseRead();
 
     return $ret;
   }
@@ -93,25 +94,25 @@ class ShmCache {
 
     $key = $this->sanitizeKey( $key );
 
-    if ( !$this->locks->everything->getReadLock() )
+    if ( !$this->locks->everything->lockForRead() )
       return false;
 
-    $bucketLock = $this->locks->bucketLock( $this->getBucketIndex( $key ) );
-    if ( !$bucketLock->getReadLock() )
+    $bucketLock = $this->locks->getBucketLock( $this->memory->getBucketIndex( $key ) );
+    if ( !$bucketLock->lockForRead() )
       return false;
 
     $ret = $this->_get( $key, $retIsSerialized, $retIsCacheHit );
 
-    $bucketLock->releaseReadLock();
-    $this->locks->everything->releaseReadLock();
+    $bucketLock->releaseRead();
+    $this->locks->everything->releaseRead();
 
     if ( $ret && $retIsSerialized )
       $ret = unserialize( $ret );
 
     if ( $retIsCacheHit )
-      ++$this->getHits;
+      ++$this->stats->getHits;
     else
-      ++$this->getMisses;
+      ++$this->stats->getMisses;
 
     return $ret;
   }
@@ -123,17 +124,17 @@ class ShmCache {
 
     $key = $this->sanitizeKey( $key );
 
-    if ( !$this->locks->everything->getReadLock() )
+    if ( !$this->locks->everything->lockForRead() )
       return false;
 
-    $bucketLock = $this->locks->bucketLock( $this->getBucketIndex( $key ) );
-    if ( !$bucketLock->getReadLock() )
+    $bucketLock = $this->locks->getBucketLock( $this->memory->getBucketIndex( $key ) );
+    if ( !$bucketLock->lockForRead() )
       return false;
 
     $ret = (bool) $this->getChunkByKey( $key );
 
-    $bucketLock->releaseReadLock();
-    $this->locks->everything->releaseReadLock();
+    $bucketLock->releaseRead();
+    $this->locks->everything->releaseRead();
 
     return $ret;
   }
@@ -146,17 +147,17 @@ class ShmCache {
     $key = $this->sanitizeKey( $key );
     $value = $this->maybeSerialize( $value, $retIsSerialized );
 
-    if ( !$this->locks->everything->getReadLock() )
+    if ( !$this->locks->everything->lockForRead() )
       return false;
 
-    $bucketLock = $this->locks->bucketLock( $this->getBucketIndex( $key ) );
-    if ( !$bucketLock->getWriteLock() )
+    $bucketLock = $this->locks->getBucketLock( $this->memory->getBucketIndex( $key ) );
+    if ( !$bucketLock->lockForWrite() )
       return false;
 
     $ret = $this->_set( $key, $value, $retIsSerialized, true );
 
-    $bucketLock->releaseWriteLock();
-    $this->locks->everything->releaseReadLock();
+    $bucketLock->releaseWrite();
+    $this->locks->everything->releaseRead();
 
     return $ret;
   }
@@ -169,17 +170,17 @@ class ShmCache {
     $key = $this->sanitizeKey( $key );
     $value = $this->maybeSerialize( $value, $retIsSerialized );
 
-    if ( !$this->locks->everything->getReadLock() )
+    if ( !$this->locks->everything->lockForRead() )
       return false;
 
-    $bucketLock = $this->locks->bucketLock( $this->getBucketIndex( $key ) );
-    if ( !$bucketLock->getWriteLock() )
+    $bucketLock = $this->locks->getBucketLock( $this->memory->getBucketIndex( $key ) );
+    if ( !$bucketLock->lockForWrite() )
       return false;
 
     $ret = $this->_set( $key, $value, $retIsSerialized, false, true );
 
-    $bucketLock->releaseWriteLock();
-    $this->locks->everything->releaseReadLock();
+    $bucketLock->releaseWrite();
+    $this->locks->everything->releaseRead();
 
     return $ret;
   }
@@ -193,11 +194,11 @@ class ShmCache {
     $offset = (int) $offset;
     $initialValue = (int) $initialValue;
 
-    if ( !$this->locks->everything->getReadLock() )
+    if ( !$this->locks->everything->lockForRead() )
       return false;
 
-    $bucketLock = $this->locks->bucketLock( $this->getBucketIndex( $key ) );
-    if ( !$bucketLock->getWriteLock() )
+    $bucketLock = $this->locks->getBucketLock( $this->memory->getBucketIndex( $key ) );
+    if ( !$bucketLock->lockForWrite() )
       return false;
 
     $value = $this->_get( $key, $retIsSerialized, $retIsCacheHit );
@@ -209,7 +210,7 @@ class ShmCache {
     }
     else if ( !is_numeric( $value ) ) {
       trigger_error( 'Item "'. $key .'" value is not numeric' );
-      $bucketLock->releaseWriteLock();
+      $bucketLock->releaseWrite();
       return false;
     }
 
@@ -217,8 +218,8 @@ class ShmCache {
     $valueSerialized = $this->maybeSerialize( $value, $retIsSerialized );
     $success = $this->_set( $key, $valueSerialized, $retIsSerialized );
 
-    $bucketLock->releaseWriteLock();
-    $this->locks->everything->releaseReadLock();
+    $bucketLock->releaseWrite();
+    $this->locks->everything->releaseRead();
 
     if ( $success )
       return $value;
@@ -241,11 +242,11 @@ class ShmCache {
 
     $key = $this->sanitizeKey( $key );
 
-    if ( !$this->locks->everything->getReadLock() )
+    if ( !$this->locks->everything->lockForRead() )
       return false;
 
-    $bucketLock = $this->locks->bucketLock( $this->getBucketIndex( $key ) );
-    if ( !$bucketLock->getWriteLock() )
+    $bucketLock = $this->locks->getBucketLock( $this->memory->getBucketIndex( $key ) );
+    if ( !$bucketLock->lockForWrite() )
       return false;
 
     $ret = false;
@@ -259,8 +260,8 @@ class ShmCache {
         $ret = $this->removeChunk( $chunk );
     }
 
-    $bucketLock->releaseWriteLock();
-    $this->locks->everything->releaseReadLock();
+    $bucketLock->releaseWrite();
+    $this->locks->everything->releaseRead();
 
     return $ret;
   }
@@ -270,7 +271,7 @@ class ShmCache {
     if ( !$this->memory )
       throw new \Exception( 'Tried to use a destroyed cache. Please create a new instance of '. __CLASS__ .'.' );
 
-    if ( !$this->locks->everything->getWriteLock() )
+    if ( !$this->locks->everything->lockForWrite() )
       return false;
 
     try {
@@ -282,7 +283,7 @@ class ShmCache {
       $ret = false;
     }
 
-    $this->locks->everything->releaseWriteLock();
+    $this->locks->everything->releaseWrite();
 
     return $ret;
   }
@@ -297,7 +298,7 @@ class ShmCache {
     if ( !$this->memory )
       throw new \Exception( 'Tried to use a destroyed cache. Please create a new instance of '. __CLASS__ .'.' );
 
-    if ( !$this->locks->everything->getWriteLock() )
+    if ( !$this->locks->everything->lockForWrite() )
       return false;
 
     try {
@@ -310,7 +311,7 @@ class ShmCache {
       $ret = false;
     }
 
-    $this->locks->everything->releaseWriteLock();
+    $this->locks->everything->releaseWrite();
 
     return $ret;
   }

@@ -49,7 +49,7 @@ class Lock {
       fclose( $this->lockFile );
   }
 
-  function getWriteLock( $try = false ) {
+  function lockForWrite( $try = false ) {
 
     if ( $this->readLockCount ) {
       trigger_error( 'Tried to acquire "'. $this->tag .'" write lock even though a read lock is already acquired' );
@@ -73,7 +73,7 @@ class Lock {
     return $ret;
   }
 
-  function releaseWriteLock() {
+  function releaseWrite() {
 
     if ( $this->readLockCount ) {
       trigger_error( 'Tried to release a "'. $this->tag .'" write lock while having a read lock' );
@@ -100,7 +100,7 @@ class Lock {
     return $ret;
   }
 
-  function getReadLock( $try = false ) {
+  function lockForRead( $try = false ) {
 
     if ( $this->writeLockCount ) {
       trigger_error( 'Tried to acquire "'. $this->tag .'" read lock even though a write lock is already acquired' );
@@ -123,7 +123,7 @@ class Lock {
     return $ret;
   }
 
-  function releaseReadLock() {
+  function releaseRead() {
 
     if ( $this->writeLockCount ) {
       trigger_error( 'Tried to release "'. $this->tag .'" write lock while having a read lock' );

@@ -18,7 +18,7 @@ class LockManager {
     $this->oldestZoneIndexLock = new Lock( 'oldestzoneindex' );
   }
 
-  function zoneLock( $zoneIndex ) {
+  function getZoneLock( $zoneIndex ) {
 
     if ( !$this->zoneLock )
       $this->zoneLock = new Lock( 'zone'. $zoneIndex );
@@ -26,7 +26,7 @@ class LockManager {
     return $this->zoneLock;
   }
 
-  function bucketLock( $bucketIndex ) {
+  function getBucketLock( $bucketIndex ) {
 
     if ( !isset( $this->bucketLocks[ $bucketIndex ] ) )
       $this->bucketLocks[ $bucketIndex ] = new Lock( 'bucket'. $bucketIndex );
