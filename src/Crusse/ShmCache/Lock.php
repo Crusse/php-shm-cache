@@ -25,9 +25,9 @@ class Lock {
       throw new \InvalidArgumentException( '$tag is not a string' );
 
     // $readLockCount and $writeLockCount are instance variables. If we let
-    // multiple Lock instances to use the same tag (and therefore the same
-    // lock), one PHP process can try to acquire a lock that it already has,
-    // ending up deadlocking itself.
+    // multiple Lock instances use the same tag (and therefore the same lock),
+    // one PHP process can try to acquire a lock that it already has, ending up
+    // deadlocking itself.
     if ( isset( self::$registeredTags[ $tag ] ) ) {
       throw new \InvalidArgumentException( 'A '. __CLASS__ .' with the tag "'. $tag .'" has already been instantiated; you can only register the same tag once' );
     }
@@ -38,6 +38,12 @@ class Lock {
   }
 
   function __destruct() {
+
+    for ( $i = 0; $i < $this->readLockCount; $i++ )
+      $this->releaseReadLock();
+
+    for ( $i = 0; $i < $this->writeLockCount; $i++ )
+      $this->releaseWriteLock();
 
     if ( $this->lockFile )
       fclose( $this->lockFile );

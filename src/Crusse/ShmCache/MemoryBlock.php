@@ -70,12 +70,15 @@ class MemoryBlock {
   const SAFE_AREA_SIZE = 1024;
   // Don't let value allocations become smaller than this, to reduce fragmentation
   const MIN_VALUE_ALLOC_SIZE = 128;
+  // The largest cache item can be this big (minus a few bytes for zone metadata)
   const ZONE_SIZE = 1048576; // 1 MiB
   // If a key string is longer than this, the key is truncated silently
   const MAX_KEY_LENGTH = 200;
   // The more hash table buckets there are, the more memory is used but the
   // faster it is to find a hash table entry
   const HASH_BUCKET_COUNT = 512;
+
+  const FLAG_SERIALIZED = 0b00000001;
 
   private $shm;
   private $shmKey;
@@ -84,9 +87,6 @@ class MemoryBlock {
   public $statsArea;
   public $hashBucketArea;
   public $zonesArea;
-
-  private $oldestZoneIndexLock;
-  private $zoneLock;
 
   private $statsProto;
   private $zoneMetaProto;
@@ -131,8 +131,6 @@ class MemoryBlock {
       $this->clearMemBlockToInitialData();
 
     $this->initializeShmObjectPrototypes();
-
-    $this->oldestZoneIndexLock = new ShmCache\Lock( 'oldestzoneindex' );
   }
 
   private function initializeShmObjectPrototypes() {
@@ -202,6 +200,10 @@ class MemoryBlock {
       shmop_close( $this->shm );
   }
 
+  function getStatsObject() {
+    return $this->statsProto->createInstance();
+  }
+
   function getChunkByOffset( $chunkOffset ) {
     return $this->chunkProto->createInstance( $chunkOffset );
   }
@@ -219,18 +221,18 @@ class MemoryBlock {
 
       $chunk = $this->getChunkByOffset( $chunkOffset );
 
-      $lock = $this->getZoneLock( $this->getZoneIndexForChunk( $chunk ) );
-      if ( !$lock->getReadLock() )
+      $zoneLock = $this->getZoneLock( $this->getZoneIndexForChunk( $chunk ) );
+      if ( !$zoneLock->getReadLock() )
         break;
 
       if ( $chunk->key === $key ) {
-        $lock->releaseLock();
+        $zoneLock->releaseReadLock();
         return $chunk;
       }
 
       $chunkOffset = $chunk->hashnext;
 
-      $lock->releaseLock();
+      $zoneLock->releaseReadLock();
     }
 
     return null;
@@ -244,25 +246,22 @@ class MemoryBlock {
     if ( !$this->unlinkChunkFromHashTable( $chunk ) )
       return false;
 
-    $lock = $this->getZoneLock( $this->getZoneIndexForChunk( $chunk ) );
-    if ( !$lock->getWriteLock() )
+    $zoneLock = $this->getZoneLock( $this->getZoneIndexForChunk( $chunk ) );
+    if ( !$zoneLock->getWriteLock() )
       return false;
+
+    $ret = false;
 
     if ( !$this->mergeChunkWithNextFreeChunks( $chunk ) )
       goto cleanup;
 
-    $ret = false;
-
+    $nextChunkOffset = $chunk->_endOffset + $chunk->valallocsize;
     $zoneMeta = $this->getZoneMetaForChunk( $chunk );
-
-    $chunkValAllocSize = $chunk->valallocsize;
-    $chunkTotalSize = $chunk->_size + $chunkValAllocSize;
-    $nextChunkOffset = $chunk->_endOffset + $chunkValAllocSize;
 
     // This is the top chunk in the zone's chunk stack. Adjust the zone's chunk
     // stack pointer.
     if ( $this->getZoneFreeChunkOffset( $zoneMeta ) === $nextChunkOffset )
-      $zoneMeta->usedspace -= $chunkTotalSize;
+      $zoneMeta->usedspace -= $chunk->_size + $chunk->valallocsize;
 
     // Free the chunk
     $chunk->valsize = 0;
@@ -270,7 +269,7 @@ class MemoryBlock {
     $ret = true;
 
     cleanup:
-    $lock->releaseLock();
+    $zoneLock->releaseWriteLock();
 
     return $ret;
   }
@@ -289,7 +288,7 @@ class MemoryBlock {
 
   function setChunkValue( ShmBackedObject $chunk, $value ) {
 
-    if ( shmop_write( $chunk->_shm, $value, $chunk->_startOffset + $this->CHUNK_META_SIZE ) === false ) {
+    if ( shmop_write( $chunk->_shm, $value, $chunk->_endOffset ) === false ) {
       trigger_error( 'Could not write chunk value' );
       return false;
     }
@@ -297,10 +296,10 @@ class MemoryBlock {
     return true;
   }
 
-  function replaceChunkValue( $chunk, $value, $valueSize, $valueIsSerialized ) {
+  function replaceChunkValue( ShmBackedObject $chunk, $value, $valueSize, $valueIsSerialized ) {
 
-    $lock = $this->getZoneLock( $this->getZoneIndexForChunk( $chunk ) );
-    if ( !$lock->getWriteLock() )
+    $zoneLock = $this->getZoneLock( $this->getZoneIndexForChunk( $chunk ) );
+    if ( !$zoneLock->getWriteLock() )
       return false;
 
     $ret = false;
@@ -323,7 +322,7 @@ class MemoryBlock {
     }
 
     cleanup:
-    $lock->releaseLock();
+    $zoneLock->releaseWriteLock();
 
     return $ret;
   }
@@ -336,8 +335,8 @@ class MemoryBlock {
    */
   function splitChunkForFreeSpace( ShmBackedObject $chunk ) {
 
-    $lock = $this->getZoneLock( $this->getZoneIndexForChunk( $chunk ) );
-    if ( !$lock->getWriteLock() )
+    $zoneLock = $this->getZoneLock( $this->getZoneIndexForChunk( $chunk ) );
+    if ( !$zoneLock->getWriteLock() )
       return false;
 
     $ret = false;
@@ -365,9 +364,28 @@ class MemoryBlock {
     $ret = true;
 
     cleanup:
-    $lock->releaseLock();
+    $zoneLock->releaseWriteLock();
 
     return $ret;
+  }
+
+  /**
+   * Returns an index in the key hash table, to the first element of the
+   * hash table item cluster (i.e. bucket) for the given key.
+   *
+   *
+   * @return int
+   */
+  function getBucketIndex( $key ) {
+
+    // Read as a 32-bit unsigned long
+    // TODO: unpack() is slow. Is there an alternative?
+    //
+    // The hash function must result in as uniform a distribution of bits
+    // as possible, over all the possible $key values. CRC32 looks pretty good:
+    // http://michiel.buddingh.eu/distribution-of-hash-values
+    //
+    return unpack( 'L', hash( 'crc32', $key, true ) )[ 1 ] % self::HASH_BUCKET_COUNT;
   }
 
   /**
@@ -402,22 +420,52 @@ class MemoryBlock {
   function removeAllChunksInZone( ShmBackedObject $zoneMeta ) {
 
     $firstChunk = $chunk = $this->getChunkByOffset( $zoneMeta->_endOffset );
+    $zoneIndex = $this->getZoneIndexForChunk( $firstChunk );
+
+    $zoneLock = $this->getZoneLock( $zoneIndex );
+    if ( !$zoneLock->getWriteLock() )
+      return false;
+
+    $ret = false;
+    $bucketLock = null;
 
     while ( $chunk ) {
 
+      // Already free
+      if ( !$chunk->valsize )
+        continue;
+
+      $bucketLock = $this->getBucketLock( $this->getBucketIndex( $chunk->key ) );
+      while ( !$bucketLock->getWriteLock( true ) ) {
+        $zoneLock->releaseWriteLock();
+        $zoneLock = $this->getZoneLock( $zoneIndex );
+        if ( !$zoneLock->getWriteLock() )
+          return false;
+      }
+
       if ( !$this->unlinkChunkFromHashTable( $chunk ) )
-        return false;
+        goto cleanup;
+
+      $bucketLock->releaseWriteLock();
+      $bucketLock = null;
 
       $chunk->valsize = 0;
       $chunk = $this->getChunkByOffset( $chunk->_endOffset + $chunk->valallocsize );
     }
 
-    $firstChunk->valallocsize = $this->MAX_CHUNK_SIZE;
+    $firstChunk->valallocsize = $this->MAX_CHUNK_SIZE - $this->CHUNK_META_SIZE;
 
     // Reset the zone's chunk stack pointer
-    $zone->usedspace = 0;
+    $zoneMeta->usedspace = 0;
+    $ret = true;
 
-    return true;
+    cleanup:
+    $zoneLock->releaseWriteLock();
+
+    if ( $bucketLock )
+      $bucketLock->releaseWriteLock();
+
+    return $ret;
   }
 
   private function initMemBlock( $desiredSize, &$retIsNewBlock ) {
@@ -613,7 +661,7 @@ class MemoryBlock {
 
   private function addChunk( $key, $value, $valueSize, $valueIsSerialized ) {
 
-    if ( $valueSize > $this->MAX_CHUNK_SIZE ) {
+    if ( $valueSize > $this->MAX_CHUNK_SIZE - $this->CHUNK_META_SIZE ) {
       trigger_error( 'Item "'. rawurlencode( $key ) .'" is too large ('. round( $valueSize / 1000, 2 ) .' KB) to cache' );
       goto error;
     }
@@ -629,7 +677,7 @@ class MemoryBlock {
 
     // The new value doesn't fit into the oldest zone. Make space for the new
     // value by evicting all chunks in the oldest zone.
-    if ( $zoneFreeSpace < $valueSize ) {
+    if ( $zoneFreeSpace < $this->CHUNK_META_SIZE + $valueSize ) {
 
       // TODO: oldestZoneIndexLock
       $oldestZoneIndex = $this->getOldestZoneIndex();
@@ -687,23 +735,6 @@ class MemoryBlock {
     }
 
     return 0;
-  }
-
-  /**
-   * Returns an index in the key hash table, to the first element of the
-   * hash table item cluster (i.e. bucket) for the given key.
-   *
-   * The hash function must result in as uniform as possible a distribution
-   * of bits over all the possible $key values. CRC32 looks pretty good:
-   * http://michiel.buddingh.eu/distribution-of-hash-values
-   *
-   * @return int
-   */
-  private function getBucketIndex( $key ) {
-
-    // Read as a 32-bit unsigned long
-    // TODO: unpack() is slow. Is there an alternative?
-    return unpack( 'L', hash( 'crc32', $key, true ) )[ 1 ] % self::HASH_BUCKET_COUNT;
   }
 
   /**
@@ -827,11 +858,6 @@ class MemoryBlock {
       $chunk->valallocsize = $newAllocSize;
 
     return true;
-  }
-
-  private function getZoneLock( $zoneIndex ) {
-    // TODO: throw an exception if trying to get a zone lock when a zone lock
-    // has already been acquired and not released
   }
 }
 

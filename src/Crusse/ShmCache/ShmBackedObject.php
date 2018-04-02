@@ -4,7 +4,7 @@ namespace Crusse\ShmCache;
 
 /**
  * "You Can Write FORTRAN in any Language". This is a C-struct-like class that
- * maps the PHP object's properties to shared memory.
+ * maps a PHP object's properties to shared memory.
  */
 class ShmBackedObject {
 
