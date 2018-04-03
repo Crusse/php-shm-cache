@@ -2,36 +2,43 @@
 
 namespace Crusse\ShmCache;
 
+/**
+ * This class creates single instances of each lock for use in the current PHP
+ * process. This is required because only one Lock can be instantiated per Lock
+ * tag.
+ */
 class LockManager {
 
-  public $everything;
-  public $stats;
-  public $oldestZoneIndex;
+  public static $everything;
+  public static $stats;
+  public static $oldestZoneIndex;
 
-  private $hashBucketLocks = [];
-  private $zoneLock;
+  private static $hashBucketLocks = [];
+  private static $zoneLocks = [];
 
   function __construct() {
 
-    $this->memAllocLock = new Lock( 'memalloc' );
-    $this->statsLock = new Lock( 'stats' );
-    $this->oldestZoneIndexLock = new Lock( 'oldestzoneindex' );
+    if ( !self::$everything ) {
+      self::$everything = new Lock( 'memalloc' );
+      self::$statsLock = new Lock( 'stats' );
+      self::$oldestZoneIndexLock = new Lock( 'oldestzoneindex' );
+    }
   }
 
   function getZoneLock( $zoneIndex ) {
 
-    if ( !$this->zoneLock )
-      $this->zoneLock = new Lock( 'zone'. $zoneIndex );
+    if ( !isset( self::$zoneLocks[ $zoneIndex ] ) )
+      self::$zoneLocks[ $zoneIndex ] = new Lock( 'zone'. $zoneIndex );
 
-    return $this->zoneLock;
+    return self::$zoneLocks[ $zoneIndex ];
   }
 
   function getBucketLock( $bucketIndex ) {
 
-    if ( !isset( $this->bucketLocks[ $bucketIndex ] ) )
-      $this->bucketLocks[ $bucketIndex ] = new Lock( 'bucket'. $bucketIndex );
+    if ( !isset( self::$bucketLocks[ $bucketIndex ] ) )
+      self::$bucketLocks[ $bucketIndex ] = new Lock( 'bucket'. $bucketIndex );
 
-    return $this->bucketLocks[ $bucketIndex ];
+    return self::$bucketLocks[ $bucketIndex ];
   }
 }
 

@@ -659,7 +659,7 @@ class MemoryBlock {
     else {
 
       // Unlock newest zone, so that we can lock the oldest zone (only one zone
-      // lock can be held at a time)
+      // lock should be held at a time to prevent deadlocks)
       $zoneLock->releaseWrite();
       $zoneLock = null;
 

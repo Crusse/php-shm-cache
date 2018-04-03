@@ -153,6 +153,10 @@ class Lock {
     return $ret;
   }
 
+  function isLocked() {
+    return (bool) ( $this->readLockCount + $this->writeLockCount );
+  }
+
   private function getLockFilePath() {
     return '/var/lock/php-shm-cache-lock-'. md5( $this->tag );
   }
