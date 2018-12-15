@@ -1119,16 +1119,16 @@ First idea (lock everything with an additional readers-writer-lock):
 
 Hash table        _A__ _B__
 buckets         1|____|____|2______
-           _3____|    ^          |5
-          |           |___6__    |
+             _3____|    ^          |5
+            |           |___6__    |
 Entry  |____v__ ______|________|_ _v_|
 zones  |_______|______|__________|___|
-     |Zone|X        |Zone Y  ^     |
-          |         ^        |
-          |         |        |
-          |    ringBufferPtr |
-          |__________________|
-                    4
+       |Zone|X        |Zone Y  ^     |
+            |         ^        |
+            |         |        |
+            |    ringBufferPtr |
+            |__________________|
+                      4
 
 1 P1: LOCK HASH_AND_ZONE_EVICTION_LOCK for read
 - P1: LOCK bucket A
