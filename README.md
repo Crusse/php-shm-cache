@@ -1,3 +1,10 @@
+**This repo is undergoing a major refactoring in the `master` branch, as my
+original implementation wasn't at all usable in real-world scenarios due to too
+broad locking of the cache (not enough granularity). Stuff is therefore
+currently broken.**
+
+----------------------------------------------------------
+
 A caching library for storing data in the operating system's shared memory.
 Data is persisted across multiple runs of a PHP script.
 
@@ -7,13 +14,6 @@ starts removing oldest items once the cache gets full.
 This library is intended as a hobby project for myself to learn about shared
 memory and locking in a familiar context (PHP). (I'm essentially "programming
 FORTRAN in any language" here.) Use at your own risk.
-
-*NOTE:*
-
-When there are parallel reads and writes (as there are on websites), locking
-is a major bottleneck, so this library is currently not really usable.
-TODO: learn more about lock granularities, so that we only do minimal work
-inside a lock.
 
 ## Installing
 
