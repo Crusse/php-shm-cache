@@ -3,7 +3,7 @@
 namespace Crusse\ShmCache;
 
 /**
- * Represents a part of the whole ShmCache shared memory block.
+ * Represents a part of a Memory.
  */
 class MemoryArea {
 
@@ -15,7 +15,7 @@ class MemoryArea {
 
   private $shm;
 
-  function __construct( MemoryBlock $shmBlock, $startOffset, $size ) {
+  function __construct( $shmBlock, $startOffset, $size ) {
 
     $this->shm = $shmBlock;
     $this->startOffset = $startOffset;
@@ -37,14 +37,14 @@ class MemoryArea {
 
   function read( $offset, $byteCount ) {
 
-    $data = shmop_read( $this->shm, $this->startOffset + $offset, $byteCount );
+    $ret = shmop_read( $this->shm, $this->startOffset + $offset, $byteCount );
 
     if ( $ret === false ) {
       trigger_error( 'Could not read from '. __CLASS__ );
       return false;
     }
 
-    return $data;
+    return $ret;
   }
 }
 

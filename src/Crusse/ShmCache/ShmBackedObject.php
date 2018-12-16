@@ -8,7 +8,7 @@ namespace Crusse\ShmCache;
  */
 class ShmBackedObject {
 
-  public $_shm;
+  public $_memory;
   public $_startOffset;
   public $_size;
   public $_endOffset;
@@ -49,7 +49,7 @@ class ShmBackedObject {
   function __get( $name ) {
 
     $prop = @$this->_properties[ $name ];
-    
+
     if ( !isset( $prop ) )
       throw new \Exception( $name .' does not exist' );
 
@@ -58,7 +58,7 @@ class ShmBackedObject {
     if ( $data === false )
       return null;
 
-    return unpack( $prop[ 'packformat' ], $data )[ 0 ];
+    return unpack( $prop[ 'packformat' ], $data )[ 1 ];
   }
 
   function __set( $name, $value ) {

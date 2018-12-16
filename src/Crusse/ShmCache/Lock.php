@@ -32,6 +32,7 @@ class Lock {
       throw new \InvalidArgumentException( 'A '. __CLASS__ .' with the tag "'. $tag .'" has already been instantiated; you can only register the same tag once' );
     }
 
+    self::$registeredTags[ $tag ] = true;
     $this->tag = $tag;
 
     $this->initLockFiles();
@@ -40,10 +41,10 @@ class Lock {
   function __destruct() {
 
     for ( $i = 0; $i < $this->readLockCount; $i++ )
-      $this->releaseReadLock();
+      $this->releaseRead();
 
     for ( $i = 0; $i < $this->writeLockCount; $i++ )
-      $this->releaseWriteLock();
+      $this->releaseWrite();
 
     if ( $this->lockFile )
       fclose( $this->lockFile );

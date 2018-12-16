@@ -6,14 +6,16 @@ class InternalsTest extends \PHPUnit\Framework\TestCase {
 
   function testTooLargeValue() {
 
-    // 16 MB cache
-    $cache = @new \Crusse\ShmCache( 1024 * 1024 * 16 );
+    $cacheSize = 1024 * 1024 * 16;
+
+    $cache = @new \Crusse\ShmCache( $cacheSize );
     $this->assertSame( true, $cache->flush() );
 
-    $maxSize = $cache->getStats()->maxItemValueSize;
+    $memory = new \Crusse\ShmCache\Memory( $cacheSize, new \Crusse\ShmCache\LockManager );
+    $maxValueSize = $memory->MAX_CHUNK_SIZE - $memory->CHUNK_META_SIZE;
 
-    $this->assertSame( true, $cache->set( 'foo', str_repeat( 'x', $maxSize ) ) );
-    $this->assertSame( false, @$cache->set( 'foo', str_repeat( 'x', $maxSize + 1 ) ) );
+    $this->assertSame( true, $cache->set( 'foo', str_repeat( 'x', $maxValueSize ) ) );
+    $this->assertSame( false, @$cache->set( 'foo', str_repeat( 'x', $maxValueSize + 1 ) ) );
   }
 
   function testRemoveOldestItemsWhenValueIsAreaFull() {

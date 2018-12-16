@@ -10,7 +10,7 @@ class Stats {
   private $locks;
   private $statsObject;
 
-  function __construct( MemoryBlock $memory, LockManager $locks ) {
+  function __construct( Memory $memory, LockManager $locks ) {
 
     $this->locks = $locks;
     $this->statsObject = $memory->getStatsObject();
@@ -26,7 +26,7 @@ class Stats {
     // TODO
     return [];
 
-    if ( !$this->locks->everything->lockForRead() )
+    if ( !$this->locks::$everything->lockForRead() )
       throw new \Exception( 'Could not get a lock' );
 
     $ret = (object) [
@@ -68,7 +68,7 @@ class Stats {
       $i += $this->CHUNK_META_SIZE + $item[ 'valallocsize' ];
     }
 
-    if ( !$this->locks->everything->releaseRead() )
+    if ( !$this->locks::$everything->releaseRead() )
       throw new \Exception( 'Could not release a lock' );
 
     $ret->avgItemValueSize = ( $ret->items )
@@ -84,7 +84,7 @@ class Stats {
   function flushToShm() {
 
     try {
-      if ( $this->locks->stats->lockForWrite() ) {
+      if ( $this->locks::$stats->lockForWrite() ) {
 
         if ( $this->getHits ) {
           $this->statsObject->gethits += $this->getHits;
@@ -96,7 +96,7 @@ class Stats {
           $this->getMisses = 0;
         }
 
-        $this->locks->stats->releaseWrite();
+        $this->locks::$stats->releaseWrite();
       }
     }
     catch ( \Exception $e ) {

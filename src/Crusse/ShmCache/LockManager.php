@@ -19,9 +19,9 @@ class LockManager {
   function __construct() {
 
     if ( !self::$everything ) {
-      self::$everything = new Lock( 'memalloc' );
-      self::$statsLock = new Lock( 'stats' );
-      self::$oldestZoneIndexLock = new Lock( 'oldestzoneindex' );
+      self::$everything = new Lock( 'everything' );
+      self::$stats = new Lock( 'stats' );
+      self::$oldestZoneIndex = new Lock( 'oldestzoneindex' );
     }
   }
 
@@ -35,10 +35,10 @@ class LockManager {
 
   function getBucketLock( $bucketIndex ) {
 
-    if ( !isset( self::$bucketLocks[ $bucketIndex ] ) )
-      self::$bucketLocks[ $bucketIndex ] = new Lock( 'bucket'. $bucketIndex );
+    if ( !isset( self::$hashBucketLocks[ $bucketIndex ] ) )
+      self::$hashBucketLocks[ $bucketIndex ] = new Lock( 'bucket'. $bucketIndex );
 
-    return self::$bucketLocks[ $bucketIndex ];
+    return self::$hashBucketLocks[ $bucketIndex ];
   }
 }
 
