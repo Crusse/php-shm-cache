@@ -12,8 +12,8 @@ The cached items have no expiration time. The cache has a FIFO queue which
 starts removing oldest items once the cache gets full.
 
 This library is intended as a hobby project for myself to learn about shared
-memory and locking in a familiar context (PHP). (I'm essentially "programming
-FORTRAN in any language" here.) Use at your own risk.
+memory and locking in a familiar context (PHP). (I'm essentially "_programming
+FORTRAN in any language_" here.) Use at your own risk.
 
 ## Installing
 
