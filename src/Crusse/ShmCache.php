@@ -257,7 +257,7 @@ class ShmCache {
       if ( !$chunk->valsize )
         $ret = true;
       else
-        $ret = $this->removeChunk( $chunk );
+        $ret = $this->memory->removeChunk( $chunk );
     }
 
     $bucketLock->releaseWrite();
@@ -341,7 +341,7 @@ class ShmCache {
 
     if ( $chunk ) {
 
-      $data = $this->getChunkValue( $chunk );
+      $data = $this->memory->getChunkValue( $chunk );
 
       if ( $data === false ) {
         trigger_error( 'Could not read value for item "'. rawurlencode( $key ) .'"' );
@@ -366,7 +366,7 @@ class ShmCache {
       if ( $mustNotExist )
         return false;
 
-      if ( $this->replaceChunkValue( $existingChunk, $value, $valueSize, $valueIsSerialized ) ) {
+      if ( $this->memory->replaceChunkValue( $existingChunk, $value, $valueSize, $valueIsSerialized ) ) {
         return true;
       }
       else {
@@ -377,7 +377,7 @@ class ShmCache {
         // Note: whenever we cannot store the value to the cache, we remove any
         // existing item with the same key. This emulates Memcached:
         // https://github.com/memcached/memcached/wiki/Performance#how-it-handles-set-failures
-        if ( !$this->removeChunk( $existingChunk ) )
+        if ( !$this->memory->removeChunk( $existingChunk ) )
           return false;
       }
     }

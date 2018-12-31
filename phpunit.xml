@@ -6,6 +6,13 @@
 	convertNoticesToExceptions="true"
 	convertWarningsToExceptions="true"
 >
+	<php>
+		<!-- Enable the assert() function calls in php-shm-cache. You will also need
+		to set zend.assertions=1 in your php.ini, as it can't be set during runtime. -->
+		<ini name="assert.active" value="1" />
+		<ini name="assert.bail" value="0" />
+		<ini name="assert.exception" value="On" />
+	</php>
 	<testsuites>
 		<testsuite>
 			<!-- Will be traversed recursively -->

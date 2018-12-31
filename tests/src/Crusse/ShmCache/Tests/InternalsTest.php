@@ -4,6 +4,10 @@ namespace Crusse\ShmCache\Tests;
 
 class InternalsTest extends \PHPUnit\Framework\TestCase {
 
+  function setUp() {
+    set_time_limit( 30 );
+  }
+
   function testTooLargeValue() {
 
     $cacheSize = 1024 * 1024 * 16;
@@ -20,13 +24,18 @@ class InternalsTest extends \PHPUnit\Framework\TestCase {
 
   function testRemoveOldestItemsWhenValueIsAreaFull() {
 
+    $cacheSize = 1024 * 1024 * 16;
+
     // 16 MB cache
-    $cache = @new \Crusse\ShmCache( 1024 * 1024 * 16 );
+    $cache = @new \Crusse\ShmCache( $cacheSize );
     $this->assertSame( true, $cache->flush() );
+
+    $memory = new \Crusse\ShmCache\Memory( $cacheSize, new \Crusse\ShmCache\LockManager );
+    $maxValueSize = $memory->MAX_CHUNK_SIZE - $memory->CHUNK_META_SIZE;
 
     // Try to store 100 items of 1 MB size
     for ( $i = 0; $i < 100; ++$i ) {
-      $this->assertSame( true, $cache->set( 'foo'. $i, str_repeat( 'x', 1024 * 1024 ) ) );
+      $this->assertSame( true, @$cache->set( 'foo'. $i, str_repeat( 'x', $maxValueSize ) ) );
     }
 
     // We expect the last 15 stored items are still available (not all of the
@@ -41,13 +50,18 @@ class InternalsTest extends \PHPUnit\Framework\TestCase {
 
   function testRemoveOldestItemsWhenValueAreaIsFullWithRandomValueSizes() {
 
+    $cacheSize = 1024 * 1024 * 16;
+
     // 16 MB cache
-    $cache = @new \Crusse\ShmCache( 1024 * 1024 * 16 );
+    $cache = @new \Crusse\ShmCache( $cacheSize );
     $this->assertSame( true, $cache->flush() );
+
+    $memory = new \Crusse\ShmCache\Memory( $cacheSize, new \Crusse\ShmCache\LockManager );
+    $maxValueSize = $memory->MAX_CHUNK_SIZE - $memory->CHUNK_META_SIZE;
 
     // Try to store 5000 items of random size
     for ( $i = 0; $i < 5000; ++$i ) {
-      $this->assertSame( true, $cache->set( 'foo'. $i, str_repeat( 'x', rand( 1, 1024 * 1024 ) ) ) );
+      $this->assertSame( true, $cache->set( 'foo'. $i, str_repeat( 'x', rand( 1, $maxValueSize ) ) ) );
     }
 
     // We expect the last 15 stored items are still available (not all of the
@@ -62,8 +76,10 @@ class InternalsTest extends \PHPUnit\Framework\TestCase {
 
   function testRemoveOldestItemsWhenMaxItemCountIsReached() {
 
+    $cacheSize = 1024 * 1024 * 16;
+
     // 16 MB cache
-    $cache = @new \Crusse\ShmCache( 1024 * 1024 * 16 );
+    $cache = @new \Crusse\ShmCache( $cacheSize );
     $this->assertSame( true, $cache->flush() );
 
     $stats = $cache->getStats();

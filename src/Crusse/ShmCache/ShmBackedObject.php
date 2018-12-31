@@ -3,8 +3,7 @@
 namespace Crusse\ShmCache;
 
 /**
- * "You Can Write FORTRAN in any Language". This is a C-struct-like class that
- * maps a PHP object's properties to shared memory.
+ * A C-struct-like class that maps a PHP object's properties to shared memory.
  */
 class ShmBackedObject {
 
@@ -13,6 +12,9 @@ class ShmBackedObject {
   public $_size;
   public $_endOffset;
   public $_properties;
+
+  // Prevent direct instantiation
+  final private function __construct() {}
 
   /**
    * @param array $propertiesSpec E.g. ['offset' => 8, 'size' => 4, 'packformat' => 'l']
@@ -38,6 +40,21 @@ class ShmBackedObject {
 
     $ret = clone $this;
     $ret->_startOffset = $startOffset;
+    $ret->_endOffset = $ret->_startOffset + $ret->_size;
+
+    return $ret;
+  }
+
+  function toArray() {
+
+    $ret = [
+      '_startOffset' => $this->_startOffset,
+      '_size' => $this->_size,
+    ];
+
+    foreach ( $this->_properties as $name => $prop ) {
+      $ret[ $name ] = $this->$name;
+    }
 
     return $ret;
   }
@@ -53,7 +70,7 @@ class ShmBackedObject {
     if ( !isset( $prop ) )
       throw new \Exception( $name .' does not exist' );
 
-    $data = $this->_memory->read( $prop[ 'offset' ], $prop[ 'size' ] );
+    $data = $this->_memory->read( $this->_startOffset + $prop[ 'offset' ], $prop[ 'size' ] );
 
     if ( $data === false )
       return null;
@@ -73,7 +90,7 @@ class ShmBackedObject {
     if ( !isset( $prop ) )
       throw new \Exception( $name .' does not exist' );
 
-    $written = $this->_memory->write( $prop[ 'offset' ], pack( $prop[ 'packformat' ], $value ) );
+    $written = $this->_memory->write( $this->_startOffset + $prop[ 'offset' ], pack( $prop[ 'packformat' ], $value ) );
 
     if ( !$written )
       return false;

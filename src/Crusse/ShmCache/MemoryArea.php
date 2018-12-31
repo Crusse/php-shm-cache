@@ -25,6 +25,8 @@ class MemoryArea {
 
   function write( $offset, $data ) {
 
+    assert( $this->startOffset + $offset + strlen( $data ) <= $this->endOffset );
+
     $ret = shmop_write( $this->shm, $data, $this->startOffset + $offset );
 
     if ( $ret === false ) {
@@ -36,6 +38,8 @@ class MemoryArea {
   }
 
   function read( $offset, $byteCount ) {
+
+    assert( $this->startOffset + $offset + $byteCount <= $this->endOffset );
 
     $ret = shmop_read( $this->shm, $this->startOffset + $offset, $byteCount );
 
