@@ -8,29 +8,31 @@ namespace Crusse\ShmCache;
 class ShmBackedObject {
 
   public $_memory;
-  public $_startOffset;
+  public $_startOffset; // Relative to MemoryArea start
   public $_size;
-  public $_endOffset;
+  public $_endOffset; // Relative to MemoryArea start
   public $_properties;
 
   // Prevent direct instantiation
   final private function __construct() {}
 
   /**
-   * @param array $propertiesSpec E.g. ['offset' => 8, 'size' => 4, 'packformat' => 'l']
+   * @param array $propertiesSpec E.g. ['size' => 4, 'packformat' => 'l']
    */
   static function createPrototype( MemoryArea $memory, array $propertiesSpec ) {
+
+    $offsetTotal = 0;
+
+    foreach ( $propertiesSpec as $propName => $spec ) {
+      $propertiesSpec[ $propName ][ 'offset' ] = $offsetTotal;
+      $offsetTotal += $spec[ 'size' ];
+    }
 
     $proto = new static;
     $proto->_memory = $memory;
     $proto->_properties = $propertiesSpec;
     $proto->_startOffset = 0;
-    $proto->_size = 0;
-
-    foreach ( $propertiesSpec as $propName => $spec ) {
-      $proto->_size += $spec[ 'size' ];
-    }
-
+    $proto->_size = $offsetTotal;
     $proto->_endOffset = $proto->_startOffset + $proto->_size;
 
     return $proto;

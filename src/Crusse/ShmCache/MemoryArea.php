@@ -17,6 +17,8 @@ class MemoryArea {
 
   function __construct( $shmBlock, $startOffset, $size ) {
 
+    assert( is_resource( $shmBlock ) );
+
     $this->shm = $shmBlock;
     $this->startOffset = $startOffset;
     $this->endOffset = $startOffset + $size;

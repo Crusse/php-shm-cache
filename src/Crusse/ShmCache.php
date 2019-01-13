@@ -45,13 +45,13 @@ class ShmCache {
         round( $desiredSize / 1024 / 1024, 5 ) .' MiB' );
     }
 
-    $this->locks = new ShmCache\LockManager();
+    $this->locks = ShmCache\LockManager::getInstance();
 
     if ( !$this->locks::$everything->lockForWrite() )
       throw new \Exception( 'Could not get a lock' );
 
-    $this->memory = new ShmCache\Memory( $desiredSize, $this->locks );
-    $this->stats = new ShmCache\Stats( $this->memory, $this->locks );
+    $this->memory = new ShmCache\Memory( $desiredSize );
+    $this->stats = new ShmCache\Stats( $this->memory );
 
     if ( !$this->locks::$everything->releaseWrite() )
       throw new \Exception( 'Could not release a lock' );
@@ -60,6 +60,7 @@ class ShmCache {
   function __destruct() {
 
     if ( $this->memory ) {
+      $this->stats->flushToShm();
       unset( $this->memory );
     }
   }
@@ -302,8 +303,8 @@ class ShmCache {
       return false;
 
     try {
-      $this->flushBufferedStatsToShm();
-      $this->destroyMemBlock();
+      $this->memory->destroy();
+      $this->memory = null;
       $ret = true;
     }
     catch ( \Exception $e ) {

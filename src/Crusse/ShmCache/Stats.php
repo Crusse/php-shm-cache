@@ -10,15 +10,10 @@ class Stats {
   private $locks;
   private $statsObject;
 
-  function __construct( Memory $memory, LockManager $locks ) {
+  function __construct( Memory $memory ) {
 
-    $this->locks = $locks;
+    $this->locks = LockManager::getInstance();
     $this->statsObject = $memory->getStatsObject();
-  }
-
-  function __destruct() {
-
-    $this->flushToShm();
   }
 
   function getStats() {
@@ -83,24 +78,19 @@ class Stats {
    */
   function flushToShm() {
 
-    try {
-      if ( $this->locks::$stats->lockForWrite() ) {
+    if ( $this->locks::$stats->lockForWrite() ) {
 
-        if ( $this->getHits ) {
-          $this->statsObject->gethits += $this->getHits;
-          $this->getHits = 0;
-        }
-
-        if ( $this->getMisses ) {
-          $this->statsObject->getmisses += $this->getMisses;
-          $this->getMisses = 0;
-        }
-
-        $this->locks::$stats->releaseWrite();
+      if ( $this->getHits ) {
+        $this->statsObject->gethits += $this->getHits;
+        $this->getHits = 0;
       }
-    }
-    catch ( \Exception $e ) {
-      trigger_error( $e->getMessage() );
+
+      if ( $this->getMisses ) {
+        $this->statsObject->getmisses += $this->getMisses;
+        $this->getMisses = 0;
+      }
+
+      $this->locks::$stats->releaseWrite();
     }
   }
 }

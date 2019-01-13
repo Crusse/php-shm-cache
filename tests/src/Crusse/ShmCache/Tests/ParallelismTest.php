@@ -10,7 +10,7 @@ class ParallelismTest extends \PHPUnit\Framework\TestCase {
   // Run before each test method
   function setUp() {
 
-    $this->cache = @new \Crusse\ShmCache();
+    $this->cache = new \Crusse\ShmCache( 16 * 1024 * 1024 );
     $this->assertSame( true, $this->cache->flush() );
   }
 

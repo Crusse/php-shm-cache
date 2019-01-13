@@ -95,6 +95,8 @@ class Memory {
   private $shm;
   private $shmKey;
 
+  private $locks;
+
   public $metaArea;
   public $statsArea;
   public $hashBucketArea;
@@ -104,16 +106,16 @@ class Memory {
   private $zoneMetaProto;
   private $chunkProto;
 
-  function __construct( $desiredSize, LockManager $locks ) {
+  function __construct( $desiredSize ) {
 
-    $this->locks = $locks;
+    $this->locks = LockManager::getInstance();
 
     // PHP doesn't allow complex expressions in class consts so we'll create
     // these "consts" here
     $this->LONG_SIZE = strlen( pack( 'l', 1 ) ); // i.e. sizeof(long) in C
     $this->CHAR_SIZE = strlen( pack( 'c', 1 ) ); // i.e. sizeof(char) in C
 
-    $this->initMemBlock( $desiredSize, $retIsNewBlock );
+    $this->openMemBlock( $desiredSize, $retIsNewBlock );
 
     $this->metaArea = new MemoryArea(
       $this->shm,
@@ -142,9 +144,12 @@ class Memory {
     $this->populateSizes();
 
     if ( $retIsNewBlock )
-      $this->clearMemBlockToInitialData();
+      $this->clearMemBlock();
 
     $this->defineShmObjectPrototypes();
+
+    if ( $retIsNewBlock )
+      $this->initializeMemBlock();
   }
 
   private function defineShmObjectPrototypes() {
@@ -153,12 +158,10 @@ class Memory {
     // property of this object
     $this->statsProto = ShmBackedObject::createPrototype( $this->statsArea, [
       'gethits' => [
-        'offset' => 0,
         'size' => $this->LONG_SIZE,
         'packformat' => 'l'
       ],
       'getmisses' => [
-        'offset' => $this->LONG_SIZE,
         'size' => $this->LONG_SIZE,
         'packformat' => 'l'
       ]
@@ -168,7 +171,6 @@ class Memory {
     // property of this object
     $this->zoneMetaProto = ShmBackedObject::createPrototype( $this->zonesArea, [
       'usedspace' => [
-        'offset' => 0,
         'size' => $this->LONG_SIZE,
         'packformat' => 'l'
       ]
@@ -181,27 +183,22 @@ class Memory {
     // "valallocsize", "valsize" and "flags" properties of this object.
     $this->chunkProto = ShmBackedObject::createPrototype( $this->zonesArea, [
       'key' => [
-        'offset' => 0,
         'size' => self::MAX_KEY_LENGTH,
         'packformat' => 'A'. self::MAX_KEY_LENGTH
       ],
       'hashnext' => [
-        'offset' => self::MAX_KEY_LENGTH,
         'size' => $this->LONG_SIZE,
         'packformat' => 'l'
       ],
       'valallocsize' => [
-        'offset' => self::MAX_KEY_LENGTH + $this->LONG_SIZE,
         'size' => $this->LONG_SIZE,
         'packformat' => 'l'
       ],
       'valsize' => [
-        'offset' => self::MAX_KEY_LENGTH + 2 * $this->LONG_SIZE,
         'size' => $this->LONG_SIZE,
         'packformat' => 'l'
       ],
       'flags' => [
-        'offset' => self::MAX_KEY_LENGTH + 3 * $this->LONG_SIZE,
         'size' => $this->CHAR_SIZE,
         'packformat' => 'c'
       ]
@@ -261,7 +258,7 @@ class Memory {
    */
   function addChunk( $key, $value, $valueSize, $valueIsSerialized ) {
 
-    if ( $valueSize > $this->MAX_CHUNK_SIZE - $this->CHUNK_META_SIZE ) {
+    if ( $valueSize > $this->MAX_VALUE_SIZE ) {
       trigger_error( 'Item "'. rawurlencode( $key ) .'" is too large ('. round( $valueSize / 1000, 2 ) .' KB) to cache' );
       return false;
     }
@@ -273,6 +270,9 @@ class Memory {
       return false;
 
     $newestZoneIndex = $this->getNewestZoneIndex();
+
+    assert( $newestZoneIndex >= 0 );
+
     if ( $newestZoneIndex < 0 )
       goto cleanup;
 
@@ -285,6 +285,10 @@ class Memory {
     }
 
     $zoneFreeSpace = $this->getZoneFreeSpace( $zoneMeta );
+
+    assert( $zoneFreeSpace >= 0 );
+    assert( $zoneFreeSpace <= $this->MAX_CHUNK_SIZE );
+
     $requiredSize = $this->CHUNK_META_SIZE + $valueSize;
 
     // The new value fits into the newest zone
@@ -309,6 +313,9 @@ class Memory {
       $zoneLock = null;
 
       $oldestZoneIndex = $this->getOldestZoneIndex();
+
+      assert( $oldestZoneIndex >= 0 );
+
       if ( $oldestZoneIndex < 0 )
         goto cleanup;
 
@@ -348,6 +355,9 @@ class Memory {
 
     $zoneMeta->usedspace += $freeChunk->_size + $freeChunk->valallocsize;
 
+    assert( $zoneMeta->usedspace > 0 );
+    assert( $zoneMeta->usedspace <= $this->MAX_CHUNK_SIZE );
+
     $ret = true;
 
     cleanup:
@@ -384,6 +394,8 @@ class Memory {
     // stack pointer.
     if ( $this->getZoneFreeChunkOffset( $zoneMeta ) === $nextChunkOffset )
       $zoneMeta->usedspace -= $chunk->_size + $chunk->valallocsize;
+
+    assert( $zoneMeta->usedspace >= 0 );
 
     // Free the chunk
     $chunk->valsize = 0;
@@ -428,7 +440,7 @@ class Memory {
 
     // There's enough space for the new value in the existing chunk.
     // Replace the value in-place.
-    if ( $valueSize <= $existingChunk->valallocsize ) {
+    if ( $valueSize <= $chunk->valallocsize ) {
 
       $flags = 0;
       if ( $valueIsSerialized )
@@ -478,10 +490,12 @@ class Memory {
       $leftOverChunk->flags = 0;
 
       assert( $leftOverChunk->valallocsize > 0 );
+      assert( $leftOverChunk->valallocsize <= $this->MAX_VALUE_SIZE );
 
       $chunk->valallocsize -= $leftOverSize;
 
       assert( $chunk->valallocsize > 0 );
+      assert( $chunk->valallocsize <= $this->MAX_VALUE_SIZE );
 
       if ( !$this->mergeChunkWithNextFreeChunks( $leftOverChunk ) )
         goto cleanup;
@@ -524,7 +538,7 @@ class Memory {
   }
 
   function getZoneIndexForChunk( ShmBackedObject $chunk ) {
-    return $chunk->_startOffset % self::ZONE_SIZE;
+    return (int) floor( $chunk->_startOffset / self::ZONE_SIZE );
   }
 
   function getZoneMetaForChunk( ShmBackedObject $chunk ) {
@@ -546,18 +560,38 @@ class Memory {
   }
 
   function flush() {
-    return $this->clearMemBlockToInitialData();
+    $this->clearMemBlock();
+    $this->initializeMemBlock();
   }
 
-  private function initMemBlock( $desiredSize, &$retIsNewBlock ) {
+  function destroy() {
 
-    $opened = $this->openMemBlock();
+    $deleted = shmop_delete( $this->shm );
+
+    if ( !$deleted ) {
+      throw new \Exception( 'Could not destroy the memory block. Try running the \'ipcrm\' command as a super-user to remove the memory block listed in the output of \'ipcs\'.' );
+    }
+
+    shmop_close( $this->shm );
+    $this->shm = null;
+  }
+
+  private function openMemBlock( $desiredSize, &$retIsNewBlock ) {
+
+    $blockKey = $this->getShmopKey();
+    $mode = 0777;
+
+    // The 'size' parameter is ignored by PHP when 'w' is used:
+    // https://github.com/php/php-src/blob/9e709e2fa02b85d0d10c864d6c996e3368e977ce/ext/shmop/shmop.c#L183
+    $this->shm = @shmop_open( $blockKey, "w", $mode, 0 );
+
+    $blockExisted = (bool) $this->shm;
 
     // Try to re-create an existing block with a larger size, if the block is
     // smaller than the desired size. This fails (at least on Linux) if the
     // Unix user trying to delete the block is different than the user that
     // created the block.
-    if ( $opened && $desiredSize ) {
+    if ( $blockExisted && $desiredSize ) {
 
       $currentSize = shmop_size( $this->shm );
 
@@ -567,7 +601,7 @@ class Memory {
         if ( shmop_delete( $this->shm ) ) {
           shmop_close( $this->shm );
           $this->shm = null;
-          $opened = false;
+          $blockExisted = false;
         }
         else {
           trigger_error( 'Could not delete the memory block. Falling back to using the existing, smaller-than-desired block.' );
@@ -576,11 +610,11 @@ class Memory {
     }
 
     // No existing memory block. Create a new one.
-    if ( !$opened )
+    if ( !$blockExisted )
       $this->createMemBlock( $desiredSize );
 
     // A new memory block. Write initial values.
-    $retIsNewBlock = !$opened;
+    $retIsNewBlock = !$blockExisted;
 
     return (bool) $this->shm;
   }
@@ -597,26 +631,14 @@ class Memory {
     $zoneMetaSize = $this->LONG_SIZE;
     $this->MAX_CHUNK_SIZE = self::ZONE_SIZE - $zoneMetaSize;
     $this->MIN_CHUNK_SIZE = $this->CHUNK_META_SIZE + self::MIN_VALUE_ALLOC_SIZE;
+    $this->MAX_VALUE_SIZE = $this->MAX_CHUNK_SIZE - $this->CHUNK_META_SIZE;
 
     // Note: we use (int) so that this is not a float value. Otherwise PHP's
-    // === doesn't work when comparing with integers, i.e. 42 === 42.0.
+    // === doesn't work when comparing with integers, because 42 !== 42.0.
     $this->ZONE_COUNT = (int) floor( $this->zonesArea->size / self::ZONE_SIZE );
-  }
 
-  /**
-   * @throws \Exception If both opening and creating a memory block failed
-   * @return bool True if an existing block was opened, false if a new block was created
-   */
-  private function openMemBlock() {
-
-    $blockKey = $this->getShmopKey();
-    $mode = 0777;
-
-    // The 'size' parameter is ignored by PHP when 'w' is used:
-    // https://github.com/php/php-src/blob/9e709e2fa02b85d0d10c864d6c996e3368e977ce/ext/shmop/shmop.c#L183
-    $this->shm = @shmop_open( $blockKey, "w", $mode, 0 );
-
-    return (bool) $this->shm;
+    $this->MAX_CHUNKS_PER_ZONE = (int) floor( ( self::ZONE_SIZE - $zoneMetaSize ) / $this->MIN_CHUNK_SIZE );
+    $this->MAX_CHUNKS = (int) ( $this->MAX_CHUNKS_PER_ZONE * $this->ZONE_COUNT );
   }
 
   private function getShmopKey() {
@@ -649,27 +671,34 @@ class Memory {
   }
 
   /**
-   * Write NULs over the whole block and initialize it with a single, free
-   * cache item.
+   * Write NULs over the whole memory block.
    */
-  private function clearMemBlockToInitialData() {
+  private function clearMemBlock() {
 
     $shmSize = shmop_size( $this->shm );
+    $memoryWriteBatch = 1024 * 1024 * 4;
+    $data = pack( 'x'. $memoryWriteBatch );
 
     // Clear all bytes to NUL in the whole shared memory block
-    $memoryWriteBatch = 1024 * 1024 * 4;
     for ( $i = 0; $i < $shmSize; $i += $memoryWriteBatch ) {
 
       // Last chunk might have to be smaller
-      if ( $i + $memoryWriteBatch > $shmSize )
+      if ( $i + $memoryWriteBatch > $shmSize ) {
         $memoryWriteBatch = $shmSize - $i;
+        $data = pack( 'x'. $memoryWriteBatch );
+      }
 
-      $data = pack( 'x'. $memoryWriteBatch );
       $res = shmop_write( $this->shm, $data, $i );
 
       if ( $res === false )
         throw new \Exception( 'Could not write NUL bytes to the memory block' );
     }
+  }
+
+  /**
+   * Initialize the memory block with a single, free cache item.
+   */
+  private function initializeMemBlock() {
 
     // Initialize zones
     for ( $i = 0; $i < $this->ZONE_COUNT; $i++ ) {
@@ -682,27 +711,16 @@ class Memory {
       $chunk = $this->getChunkByOffset( $i * self::ZONE_SIZE + $zoneMeta->_size );
       $chunk->key = '';
       $chunk->hashnext = 0;
-      $chunk->valallocsize = $this->MAX_CHUNK_SIZE - $this->CHUNK_META_SIZE;
+      $chunk->valallocsize = $this->MAX_VALUE_SIZE;
       $chunk->valsize = 0;
       $chunk->flags = 0;
 
       assert( $zoneMeta->usedspace === 0 );
       assert( $chunk->valallocsize > 0 );
+      assert( $chunk->valallocsize <= $this->MAX_VALUE_SIZE );
     }
 
     $this->setOldestZoneIndex( $this->ZONE_COUNT - 1 );
-  }
-
-  private function destroyMemBlock() {
-
-    $deleted = shmop_delete( $this->shm );
-
-    if ( !$deleted ) {
-      throw new \Exception( 'Could not destroy the memory block. Try running the \'ipcrm\' command as a super-user to remove the memory block listed in the output of \'ipcs\'.' );
-    }
-
-    shmop_close( $this->shm );
-    $this->shm = null;
   }
 
   private function getNewestZoneIndex() {
@@ -896,10 +914,13 @@ class Memory {
       $nextChunkOffset = $nextChunkOffset + $nextChunk->_size + $nextChunk->valallocsize;
     }
 
-    if ( $newAllocSize !== $origAllocSize )
+    if ( $newAllocSize !== $origAllocSize ) {
+      assert( $newAllocSize > $origAllocSize );
       $chunk->valallocsize = $newAllocSize;
+    }
 
     assert( $chunk->valallocsize > 0 );
+    assert( $chunk->valallocsize <= $this->MAX_VALUE_SIZE );
 
     return true;
   }
@@ -923,8 +944,8 @@ class Memory {
 
     while ( true ) {
 
-      if ( $chunk->valallocsize < 1 )
-        throw new \Exception( 'FIXME' );
+      assert( $chunk->valallocsize > 0 );
+      assert( $chunk->valallocsize <= $this->MAX_VALUE_SIZE );
 
       // Not already freed
       if ( $chunk->valsize ) {
@@ -968,8 +989,9 @@ class Memory {
       $chunk = $this->getChunkByOffset( $nextChunkOffset );
     }
 
-    $firstChunk->valallocsize = $this->MAX_CHUNK_SIZE - $this->CHUNK_META_SIZE;
+    $firstChunk->valallocsize = $this->MAX_VALUE_SIZE;
     assert( $firstChunk->valallocsize > 0 );
+    assert( $firstChunk->valallocsize <= $this->MAX_VALUE_SIZE );
 
     // Reset the zone's chunk stack pointer
     $zoneMeta->usedspace = 0;

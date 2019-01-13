@@ -40,12 +40,6 @@ class Lock {
 
   function __destruct() {
 
-    for ( $i = 0; $i < $this->readLockCount; $i++ )
-      $this->releaseRead();
-
-    for ( $i = 0; $i < $this->writeLockCount; $i++ )
-      $this->releaseWrite();
-
     if ( $this->lockFile )
       fclose( $this->lockFile );
   }
