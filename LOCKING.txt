@@ -1072,7 +1072,7 @@ P1: UNLOCK zone Y
 There is also a more subtle deadlock that the trylocking (wait/wound locking)
 fixes, between A->Y->B and B->Y->A. In the following example zone Y has two
 chunks: first one is associated with bucket B, and the second one is associated
-with bucket A. From this we can see that when try TRYLOCK fails, the process
+with bucket A. From this we can see that when the TRYLOCK fails, the process
 must also drop the RBP lock, not just the zone lock.
 ---------------------------------------
 P1: LOCK bucket A
@@ -1302,8 +1302,8 @@ RULE 1: to modify anything else than the ok-to-free dirty-bit in a zone chunk,
 RULE 2: to modify _anything_ in zones, you need to hold the zone's lock
 
 RULE 3: the lock order between a bucket and a zone lock must always be
-        bucket->zone, not zone->bucket. For ringBufferPtr it's always
-        ringBufferPtr->zone. So, lock order:
+        bucket -> zone, not zone -> bucket. For ringBufferPtr it's always
+        ringBufferPtr -> zone. So, lock order:
 
         Bucket lock -> ringBufferPtr lock -> zone lock
 
@@ -1314,8 +1314,8 @@ RULE 5: bultiple buckets can be locked at the same time, but _only_ by using
         the trylock fails, the process must drop its zone lock and
         ringBufferPtr lock before trying again.
 
-RULE 6: you can violate RULE 3's bucket->zone order and acquire a lock in
-        zone->bucket order, but only if you use a trylock, AND all processes
+RULE 6: you can violate RULE 3's bucket -> zone order and acquire a lock in
+        zone -> bucket order, but only if you use a trylock, AND all processes
         must lock (not trylock) either the same bucket lock or the same zone
         lock first, before the trylock.
 

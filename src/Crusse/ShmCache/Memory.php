@@ -75,7 +75,7 @@ class Memory {
   // Total amount of space to allocate for the shared memory block. This will
   // contain both the keys area and the zones area, so the amount allocatable
   // for zones will be slightly smaller.
-  const DEFAULT_CACHE_SIZE = 134217728;
+  const DEFAULT_CACHE_SIZE = 134217728; // 128 MB
   const SAFE_AREA_SIZE = 1024;
   // Don't let value allocations become smaller than this, to reduce fragmentation
   const MIN_VALUE_ALLOC_SIZE = 128;
@@ -92,19 +92,19 @@ class Memory {
 
   const FLAG_SERIALIZED = 0b00000001;
 
-  private $shm;
-  private $shmKey;
+  private $shm; // resource
+  private $shmKey; // int
 
-  private $locks;
+  private $locks; // LockManager
 
-  public $metaArea;
-  public $statsArea;
-  public $hashBucketArea;
-  public $zonesArea;
+  public $metaArea; // MemoryArea
+  public $statsArea; // MemoryArea
+  public $hashBucketArea; // MemoryArea
+  public $zonesArea; // MemoryArea
 
-  private $statsProto;
-  private $zoneMetaProto;
-  private $chunkProto;
+  private $statsProto; // ShmBackedObject
+  private $zoneMetaProto; // ShmBackedObject
+  private $chunkProto; // ShmBackedObject
 
   function __construct( $desiredSize ) {
 
@@ -221,6 +221,8 @@ class Memory {
    * @return ShmBackedObject
    */
   function getChunkByOffset( $chunkOffset ) {
+    assert( $chunkOffset > 0 );
+    assert( $chunkOffset <= $this->zonesArea->size - $this->MIN_CHUNK_SIZE );
     return $this->chunkProto->createInstance( $chunkOffset );
   }
 
@@ -234,11 +236,16 @@ class Memory {
 
     while ( $chunkOffset > 0 ) {
 
-      $chunk = $this->getChunkByOffset( $chunkOffset );
-
-      $zoneLock = $this->locks->getZoneLock( $this->getZoneIndexForChunk( $chunk ) );
+      $zoneLock = $this->locks->getZoneLock( $this->getZoneIndexForChunkOffset( $chunkOffset ) );
       if ( !$zoneLock->lockForRead() )
         break;
+
+      $chunk = $this->getChunkByOffset( $chunkOffset );
+
+      // Chunk should not be freed if it's in the hash table
+      assert( $chunk->valallocsize > 0 );
+      // Chunk should never point back to itself
+      assert( $chunk->hashnext !== $chunkOffset );
 
       if ( $chunk->key === $key ) {
         $zoneLock->releaseRead();
@@ -270,12 +277,6 @@ class Memory {
       return false;
 
     $newestZoneIndex = $this->getNewestZoneIndex();
-
-    assert( $newestZoneIndex >= 0 );
-
-    if ( $newestZoneIndex < 0 )
-      goto cleanup;
-
     $zoneMeta = $this->getZoneMetaByIndex( $newestZoneIndex );
 
     $zoneLock = $this->locks->getZoneLock( $newestZoneIndex );
@@ -285,19 +286,21 @@ class Memory {
     }
 
     $zoneFreeSpace = $this->getZoneFreeSpace( $zoneMeta );
-
-    assert( $zoneFreeSpace >= 0 );
-    assert( $zoneFreeSpace <= $this->MAX_CHUNK_SIZE );
-
     $requiredSize = $this->CHUNK_META_SIZE + $valueSize;
+
+    assert( $requiredSize <= $this->MAX_CHUNK_SIZE );
+
+    $freeChunk = null;
 
     // The new value fits into the newest zone
     if ( $zoneFreeSpace >= $requiredSize ) {
 
-      $freeChunk = $this->getChunkByOffset( $this->getZoneFreeChunkOffset( $zoneMeta ) );
+      $freeChunkOffset = $this->getZoneFreeChunkOffset( $zoneMeta );
+      $freeChunk = $this->getChunkByOffset( $freeChunkOffset );
 
-      // Make sure the chunk pointed to by the zone's stack pointer is large
-      // enough (i.e. it's merged with chunks that come after it in the zone)
+      // Make sure the chunk pointed to by the zone's stack pointer (i.e. the
+      // zone's free space) is large enough (i.e. it's merged with chunks that
+      // come after it in the zone)
       if ( $freeChunk->valallocsize < $requiredSize ) {
         if ( !$this->mergeChunkWithNextFreeChunks( $freeChunk ) )
           goto cleanup;
@@ -313,12 +316,6 @@ class Memory {
       $zoneLock = null;
 
       $oldestZoneIndex = $this->getOldestZoneIndex();
-
-      assert( $oldestZoneIndex >= 0 );
-
-      if ( $oldestZoneIndex < 0 )
-        goto cleanup;
-
       $zoneMeta = $this->getZoneMetaByIndex( $oldestZoneIndex );
 
       $zoneLock = $this->locks->getZoneLock( $oldestZoneIndex );
@@ -343,13 +340,19 @@ class Memory {
     $freeChunk->key = $key;
     $freeChunk->valsize = $valueSize;
     $freeChunk->flags = $flags;
+    $freeChunk->hashnext = 0;
 
     if ( !$this->setChunkValue( $freeChunk, $value ) )
       goto cleanup;
 
-    if ( !$this->linkChunkToHashTable( $freeChunk ) )
+    if ( !$this->linkChunkToHashTable( $freeChunk ) ) {
+      trigger_error( 'Could not link chunk for key "'. $key .'" to hash table' );
       goto cleanup;
+    }
 
+    // FIXME: there might be a bug here, as tests are currently failing, but
+    // not when this is commented out. Check if mergeChunkWithNextFreeChunks()
+    // or splitChunkForFreeSpace() has a bug.
     if ( !$this->splitChunkForFreeSpace( $freeChunk ) )
       goto cleanup;
 
@@ -378,7 +381,7 @@ class Memory {
     if ( !$this->unlinkChunkFromHashTable( $chunk ) )
       return false;
 
-    $zoneLock = $this->locks->getZoneLock( $this->getZoneIndexForChunk( $chunk ) );
+    $zoneLock = $this->locks->getZoneLock( $this->getZoneIndexForChunkOffset( $chunk->_startOffset ) );
     if ( !$zoneLock->lockForWrite() )
       return false;
 
@@ -432,7 +435,7 @@ class Memory {
 
   function replaceChunkValue( ShmBackedObject $chunk, $value, $valueSize, $valueIsSerialized ) {
 
-    $zoneLock = $this->locks->getZoneLock( $this->getZoneIndexForChunk( $chunk ) );
+    $zoneLock = $this->locks->getZoneLock( $this->getZoneIndexForChunkOffset( $chunk->_startOffset ) );
     if ( !$zoneLock->lockForWrite() )
       return false;
 
@@ -469,7 +472,7 @@ class Memory {
    */
   function splitChunkForFreeSpace( ShmBackedObject $chunk ) {
 
-    $zoneLock = $this->locks->getZoneLock( $this->getZoneIndexForChunk( $chunk ) );
+    $zoneLock = $this->locks->getZoneLock( $this->getZoneIndexForChunkOffset( $chunk->_startOffset ) );
     if ( !$zoneLock->lockForWrite() )
       return false;
 
@@ -534,19 +537,31 @@ class Memory {
    * You must hold the zone's lock when calling this.
    */
   function getZoneMetaByIndex( $zoneIndex ) {
+    assert( $zoneIndex >= 0 );
+    assert( $zoneIndex < $this->ZONE_COUNT );
     return $this->zoneMetaProto->createInstance( $zoneIndex * self::ZONE_SIZE );
   }
 
-  function getZoneIndexForChunk( ShmBackedObject $chunk ) {
-    return (int) floor( $chunk->_startOffset / self::ZONE_SIZE );
+  /**
+   * @param int $chunkOffset Offset relative to the zones area start
+   */
+  function getZoneIndexForChunkOffset( $chunkOffset ) {
+    assert( $chunkOffset <= $this->zonesArea->size - $this->MIN_CHUNK_SIZE );
+    return (int) floor( $chunkOffset / self::ZONE_SIZE );
   }
 
   function getZoneMetaForChunk( ShmBackedObject $chunk ) {
-    return $this->getZoneMetaByIndex( $this->getZoneIndexForChunk( $chunk ) );
+    return $this->getZoneMetaByIndex( $this->getZoneIndexForChunkOffset( $chunk->_startOffset ) );
   }
 
   function getZoneFreeSpace( ShmBackedObject $zoneMeta ) {
-    return $this->MAX_CHUNK_SIZE - $zoneMeta->usedspace;
+
+    $freeSpace = $this->MAX_CHUNK_SIZE - $zoneMeta->usedspace;
+
+    assert( $freeSpace >= 0 );
+    assert( $freeSpace <= $this->MAX_CHUNK_SIZE );
+
+    return $freeSpace;
   }
 
   /**
@@ -556,7 +571,9 @@ class Memory {
    * You must hold a zone lock when calling this.
    */
   function getZoneFreeChunkOffset( ShmBackedObject $zoneMeta ) {
-    return $zoneMeta->_endOffset + $zoneMeta->usedspace;
+    $freeChunkOffset = $zoneMeta->_endOffset + $zoneMeta->usedspace;
+    assert( $freeChunkOffset <= $this->zonesArea->size - $this->MIN_CHUNK_SIZE );
+    return $freeChunkOffset;
   }
 
   function flush() {
@@ -633,12 +650,16 @@ class Memory {
     $this->MIN_CHUNK_SIZE = $this->CHUNK_META_SIZE + self::MIN_VALUE_ALLOC_SIZE;
     $this->MAX_VALUE_SIZE = $this->MAX_CHUNK_SIZE - $this->CHUNK_META_SIZE;
 
-    // Note: we use (int) so that this is not a float value. Otherwise PHP's
-    // === doesn't work when comparing with integers, because 42 !== 42.0.
+    // Note: we cast to (int) so that this is not a float value. Otherwise
+    // PHP's === doesn't work when comparing with ints, because 42 !== 42.0.
     $this->ZONE_COUNT = (int) floor( $this->zonesArea->size / self::ZONE_SIZE );
 
     $this->MAX_CHUNKS_PER_ZONE = (int) floor( ( self::ZONE_SIZE - $zoneMetaSize ) / $this->MIN_CHUNK_SIZE );
     $this->MAX_CHUNKS = (int) ( $this->MAX_CHUNKS_PER_ZONE * $this->ZONE_COUNT );
+
+    $this->MAX_TOTAL_VALUE_SIZE = (int) ( $this->ZONE_COUNT * $this->MAX_VALUE_SIZE );
+
+    $this->SHM_SIZE = (int) shmop_size( $this->shm );
   }
 
   private function getShmopKey() {
@@ -730,8 +751,6 @@ class Memory {
     if ( $index === -1 )
       $index = $this->ZONE_COUNT - 1;
 
-    assert( $index >= 0 );
-
     return $index;
   }
 
@@ -747,6 +766,9 @@ class Memory {
       trigger_error( 'Could not find the oldest zone index' );
       return -1;
     }
+
+    assert( $index >= 0 );
+    assert( $index < $this->ZONE_COUNT );
 
     return $index;
   }
@@ -779,16 +801,19 @@ class Memory {
   /**
    * You must hold a bucket lock when calling this.
    */
-  private function findHashTablePrevChunkOffset( ShmBackedObject $chunk, $bucketIndex ) {
+  private function findHashTablePrevChunkOffset( ShmBackedObject $chunk, $bucketHeadChunkOffset ) {
 
     $chunkOffset = $chunk->_startOffset;
-    $currentOffset = $this->getBucketHeadChunkOffset( $bucketIndex );
+    $currentOffset = $bucketHeadChunkOffset;
 
     while ( $currentOffset ) {
       $testChunk = $this->getChunkByOffset( $currentOffset );
       $nextOffset = $testChunk->hashnext;
-      if ( $nextOffset === $chunkOffset )
+
+      if ( $nextOffset === $chunkOffset ) {
         return $currentOffset;
+      }
+
       $currentOffset = $nextOffset;
     }
 
@@ -799,6 +824,9 @@ class Memory {
    * @return int A chunk offset relative to the zones area
    */
   private function getBucketHeadChunkOffset( $bucketIndex ) {
+
+    assert( $bucketIndex >= 0 );
+    assert( $bucketIndex < self::HASH_BUCKET_COUNT );
 
     $data = shmop_read(
       $this->shm,
@@ -811,14 +839,24 @@ class Memory {
       return 0;
     }
 
-    return unpack( 'l', $data )[ 1 ];
+    $chunkOffset = unpack( 'l', $data )[ 1 ];
+
+    assert( $chunkOffset >= 0 );
+    assert( $chunkOffset <= $this->zonesArea->size - $this->MIN_CHUNK_SIZE );
+
+    return $chunkOffset;
   }
 
-  private function setBucketHeadChunkOffset( $bucketIndex, $itemMetaOffset ) {
+  private function setBucketHeadChunkOffset( $bucketIndex, $chunkOffset ) {
+
+    assert( $bucketIndex >= 0 );
+    assert( $bucketIndex < self::HASH_BUCKET_COUNT );
+    assert( $chunkOffset >= 0 );
+    assert( $chunkOffset <= $this->zonesArea->size - $this->MIN_CHUNK_SIZE );
 
     $ret = shmop_write(
       $this->shm,
-      pack( 'l', $itemMetaOffset ),
+      pack( 'l', $chunkOffset ),
       $this->hashBucketArea->startOffset + $bucketIndex * $this->LONG_SIZE
     );
 
@@ -841,13 +879,21 @@ class Memory {
     if ( !$existingChunkOffset )
       return $this->setBucketHeadChunkOffset( $bucketIndex, $chunk->_startOffset );
 
-    while ( $existingChunkOffset ) {
+    while ( $existingChunkOffset > 0 ) {
+
       $existingChunk = $this->getChunkByOffset( $existingChunkOffset );
-      if ( !$existingChunk->hashnext ) {
+      $hashNext = $existingChunk->hashnext;
+
+      if ( !$hashNext ) {
+        // Check that we're not trying to link an already linked chunk to
+        // the hash table
+        assert( $existingChunk->_startOffset !== $chunk->_startOffset );
+
         $existingChunk->hashnext = $chunk->_startOffset;
         return true;
       }
-      $existingChunkOffset = $existingChunk->hashnext;
+
+      $existingChunkOffset = $hashNext;
     }
 
     return false;
@@ -862,18 +908,28 @@ class Memory {
     $bucketHeadChunkOffset = $this->getBucketHeadChunkOffset( $bucketIndex );
 
     if ( !$bucketHeadChunkOffset ) {
-      trigger_error( 'Key "'. rawurlencode( $chunk->key ) .'"\'s bucket is empty' );
+      trigger_error( 'The hash table bucket for key "'. rawurlencode( $chunk->key ) .'" is empty' );
       return false;
     }
 
+    // The chunk to unlink is the head chunk of the hash table
     if ( $chunk->_startOffset === $bucketHeadChunkOffset ) {
-      // Note that $chunk->hashnext can be 0 here
+
+      // Check that the chunk doesn't point to itself
+      assert( $chunk->hashnext !== $chunk->_startOffset );
+
+      // Note that $chunk->hashnext is 0 here when the hash table bucket
+      // has no more chunks in it
       return $this->setBucketHeadChunkOffset( $bucketIndex, $chunk->hashnext );
     }
 
-    $prevChunkOffset = $this->findHashTablePrevChunkOffset( $chunk, $bucketIndex );
-    if ( !$prevChunkOffset )
+    // $chunk is not the head chunk of the hash table bucket. Find the chunk
+    // that immediately precedes $chunk in the bucket.
+    $prevChunkOffset = $this->findHashTablePrevChunkOffset( $chunk, $bucketHeadChunkOffset );
+    if ( !$prevChunkOffset ) {
+      trigger_error( 'Found no previous chunk in the hash table bucket for key "'. $rawurlencode( $chunk->key ) .'"' );
       return false;
+    }
 
     $prevChunk = $this->getChunkByOffset( $prevChunkOffset );
 
@@ -894,17 +950,18 @@ class Memory {
    */
   private function mergeChunkWithNextFreeChunks( ShmBackedObject $chunk ) {
 
-    $zoneIndex = $this->getZoneIndexForChunk( $chunk );
+    $zoneIndex = $this->getZoneIndexForChunkOffset( $chunk->_startOffset );
 
     $newAllocSize = $origAllocSize = $chunk->valallocsize;
     $nextChunkOffset = $chunk->_endOffset + $origAllocSize;
 
     while ( $nextChunkOffset ) {
 
-      $nextChunk = $this->getChunkByOffset( $nextChunkOffset );
-
-      if ( $this->getZoneIndexForChunk( $nextChunk ) !== $zoneIndex )
+      // Hit the next zone
+      if ( $this->getZoneIndexForChunkOffset( $nextChunkOffset ) !== $zoneIndex )
         break;
+
+      $nextChunk = $this->getChunkByOffset( $nextChunkOffset );
 
       // Found a non-free chunk
       if ( $nextChunk->valsize )
@@ -932,7 +989,7 @@ class Memory {
   private function removeAllChunksInZone( ShmBackedObject $zoneMeta ) {
 
     $firstChunk = $chunk = $this->getChunkByOffset( $zoneMeta->_endOffset );
-    $zoneIndex = $this->getZoneIndexForChunk( $firstChunk );
+    $zoneIndex = $this->getZoneIndexForChunkOffset( $firstChunk->_startOffset );
 
     $zoneLock = $this->locks->getZoneLock( $zoneIndex );
     if ( !$zoneLock->lockForWrite() )
@@ -961,8 +1018,13 @@ class Memory {
           $zoneLock->releaseWrite();
           $zoneLock = null;
 
-          if ( microtime( true ) - $startTime > self::TRYLOCK_TIMEOUT )
+          // TODO: according to LOCKING.txt the ringBufferPtr lock also needs
+          // to be unlocked here
+
+          if ( microtime( true ) - $startTime > self::TRYLOCK_TIMEOUT ) {
+            trigger_error( 'Try-lock timeout' );
             goto cleanup;
+          }
 
           $zoneLock = $this->locks->getZoneLock( $zoneIndex );
 
@@ -995,6 +1057,9 @@ class Memory {
 
     // Reset the zone's chunk stack pointer
     $zoneMeta->usedspace = 0;
+
+    assert( $zoneMeta->usedspace === 0 );
+
     $ret = true;
 
     cleanup:

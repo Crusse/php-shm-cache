@@ -4,128 +4,80 @@ namespace Crusse\ShmCache\Tests;
 
 class InternalsTest extends \PHPUnit\Framework\TestCase {
 
+  const CACHE_SIZE = 16777216;
+
+  private $cache;
+
   function setUp() {
     // Fail on infinite loops or failure to acquire locks
     set_time_limit( 30 );
+
+    // Destroy the cache to delete any previous shared memory block created by
+    // ShmCache, so that we can be sure ShmCache creates a memory block of
+    // CACHE_SIZE
+    $cache = new \Crusse\ShmCache( self::CACHE_SIZE );
+    $this->assertSame( true, $cache->destroy() );
+
+    $this->cache = new \Crusse\ShmCache( self::CACHE_SIZE );
+
+    // Make sure ShmCache created a memory block of CACHE_SIZE
+    $memory = new \Crusse\ShmCache\Memory( self::CACHE_SIZE );
+    $this->assertEquals( self::CACHE_SIZE, $memory->SHM_SIZE );
+  }
+
+  function tearDown() {
+    $this->assertSame( true, $this->cache->destroy() );
   }
 
   function testTooLargeValue() {
 
-    $cacheSize = 1024 * 1024 * 16;
+    $memory = new \Crusse\ShmCache\Memory( self::CACHE_SIZE );
 
-    $cache = new \Crusse\ShmCache( $cacheSize );
-    $this->assertSame( true, $cache->flush() );
-
-    $memory = new \Crusse\ShmCache\Memory( $cacheSize );
-
-    $this->assertSame( true, $cache->set( 'foo', str_repeat( 'x', $memory->MAX_VALUE_SIZE ) ) );
-    $this->assertSame( false, @$cache->set( 'foo', str_repeat( 'x', $memory->MAX_VALUE_SIZE + 1 ) ) );
+    $this->assertSame( true, $this->cache->set( 'foo', str_repeat( 'x', $memory->MAX_VALUE_SIZE ) ) );
+    $this->assertSame( false, @$this->cache->set( 'foo', str_repeat( 'x', $memory->MAX_VALUE_SIZE + 1 ) ) );
   }
 
   function testRemoveOldestItemsWhenValueIsAreaFull() {
 
-    $cacheSize = 1024 * 1024 * 16;
-
-    // 16 MB cache
-    $cache = new \Crusse\ShmCache( $cacheSize );
-    $this->assertSame( true, $cache->flush() );
-
-    $memory = new \Crusse\ShmCache\Memory( $cacheSize );
+    $memory = new \Crusse\ShmCache\Memory( self::CACHE_SIZE );
 
     // Try to store 100 items of 1 MB size
     for ( $i = 0; $i < 100; ++$i ) {
-      $this->assertSame( true, @$cache->set( 'foo'. $i, str_repeat( 'x', $memory->MAX_VALUE_SIZE ) ) );
+      $this->assertSame( true, @$this->cache->set( 'foo'. $i, str_repeat( 'x', $memory->MAX_VALUE_SIZE ) ) );
     }
 
     // We expect the last 15 stored items are still available (not all of the
     // 16 MB of the cache is available for storage, which is why we don't
     // expect 16 values to be available).
     for ( $i = 85; $i < 100; ++$i ) {
-      $this->assertSame( 0, strpos( $cache->get( 'foo'. $i ), 'xxxxxx' ), 'Could not read "foo'. $i .'"' );
+      $this->assertSame( 0, strpos( $this->cache->get( 'foo'. $i ), 'xxxxxx' ), 'Could not read "foo'. $i .'"' );
     }
-
-    $this->assertSame( true, $cache->destroy() );
   }
 
-  function testRemoveOldestItemsWhenValueAreaIsFullWithRandomValueSizes() {
+  function testRemoveOldestItemsWhenMemoryIsFull() {
 
-    $cacheSize = 1024 * 1024 * 16;
+    $memory = new \Crusse\ShmCache\Memory( self::CACHE_SIZE );
 
-    // 16 MB cache
-    $cache = new \Crusse\ShmCache( $cacheSize );
-    $this->assertSame( true, $cache->flush() );
+    // Sanity check to make sure our memory is actually 16 MB, and not a much
+    // larger size due to an earlier ShmCache instantiaton, as ShmCache uses
+    // the largest shared memory size ever reserved
+    $this->assertLessThanOrEqual( self::CACHE_SIZE, $memory->SHM_SIZE );
+    $this->assertLessThan( self::CACHE_SIZE, $memory->MAX_TOTAL_VALUE_SIZE );
 
-    $memory = new \Crusse\ShmCache\Memory( $cacheSize );
+    $valueCount = $memory->MAX_CHUNKS + 50;
 
-    // Try to store 5000 items of random size
-    for ( $i = 0; $i < 5000; ++$i ) {
+    // Try to store more than max amount of items of random size
+    for ( $i = 0; $i < $valueCount; ++$i ) {
       $valSize = rand( 1, $memory->MAX_VALUE_SIZE );
-      $this->assertSame( true, $cache->set( 'foo'. $i, str_repeat( 'x', $valSize ) ) );
+      $this->assertSame( true, $this->cache->set( 'foo'. $i, str_repeat( 'x', $valSize ) ) );
     }
 
-    // We expect the last 15 stored items are still available (not all of the
+    // We expect the last few stored items are still available (not all of the
     // 16 MB of the cache is available for storage, which is why we don't
     // expect 16 values to be available).
-    for ( $i = 4985; $i < 5000; ++$i ) {
-      $this->assertSame( 0, strpos( $cache->get( 'foo'. $i ), 'xxxxxx' ), 'Could not read "foo'. $i .'"' );
+    for ( $i = $valueCount - 10; $i < $valueCount; ++$i ) {
+      $this->assertSame( 0, strpos( $this->cache->get( 'foo'. $i ), 'xxxxxx' ), 'Could not read "foo'. $i .'"' );
     }
-
-    $this->assertSame( true, $cache->destroy() );
-  }
-
-  function testRemoveOldestItemsWhenMaxItemCountIsReached() {
-
-    $cacheSize = 1024 * 1024 * 16;
-
-    // 16 MB cache
-    $cache = new \Crusse\ShmCache( $cacheSize );
-    $this->assertSame( true, $cache->flush() );
-
-    $memory = new \Crusse\ShmCache\Memory( $cacheSize );
-    $excess = min( 500, $memory->MAX_CHUNKS );
-
-    // Try to store more items than there are slots for
-    for ( $i = 0; $i < $memory->MAX_CHUNKS + $excess; ++$i ) {
-      // Store 1-byte values
-      $this->assertSame( true, $cache->set( 'foo'. $i, 'x' ) );
-    }
-
-    for ( $i = $excess; $i < $memory->MAX_CHUNKS + $excess; ++$i ) {
-      $this->assertSame( 'x', $cache->get( 'foo'. $i ) );
-    }
-
-    $this->assertSame( true, $cache->destroy() );
-  }
-
-  function testRemoveOldestItemsWhenMaxItemCountIsReachedWithRandomValueSizes() {
-
-    // 16 MB cache
-    $cache = new \Crusse\ShmCache( 1024 * 1024 * 16 );
-    $this->assertSame( true, $cache->flush() );
-
-    $stats = $cache->getStats();
-    $minSizePerItem = $stats->itemMetadataSize + $stats->minItemValueSize;
-
-    // If we always hit the memory limit before the item count limit, we cannot
-    // test exceeding the item count limit
-    $this->assertSame( true, $minSizePerItem * $stats->maxItems < $stats->availableValueMemSize );
-
-    $excess = min( 5000, $stats->maxItems );
-
-    // Try to store more items than there are slots for
-    for ( $i = 0; $i < $stats->maxItems + $excess; ++$i ) {
-      // Store values with sizes that will either fit fully in
-      // minItemValueSize, or exceed that by 1 byte, so that ShmCache will
-      // have to do splitting and merging of items
-      $this->assertSame( true, $cache->set( 'foo'. $i, str_repeat( 'x', $stats->minItemValueSize + rand( 0, 1 ) ) ) );
-    }
-
-    // We expects at least half of the last stored items to exist in the cache
-    for ( $i = $stats->maxItems + $excess - 1, $j = 0; $j < $stats->maxItems / 2; --$i, ++$j ) {
-      $this->assertSame( 0, strpos( $cache->get( 'foo'. $i ), str_repeat( 'x', $stats->minItemValueSize ) ) );
-    }
-
-    $this->assertSame( true, $cache->destroy() );
   }
 }
 

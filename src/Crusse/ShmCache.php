@@ -26,9 +26,9 @@ namespace Crusse;
  */
 class ShmCache {
 
-  private $memory;
-  private $locks;
-  private $stats;
+  private $memory; // Memory
+  private $locks; // LockManager
+  private $stats; // Stats
 
   /**
    * @param $desiredSize The size of the shared memory block, which will contain all ShmCache data. If a block already exists and its size is larger, the block's size will not be reduced. If its size is smaller, it will be enlarged.
@@ -50,8 +50,14 @@ class ShmCache {
     if ( !$this->locks::$everything->lockForWrite() )
       throw new \Exception( 'Could not get a lock' );
 
-    $this->memory = new ShmCache\Memory( $desiredSize );
-    $this->stats = new ShmCache\Stats( $this->memory );
+    try {
+      $this->memory = new ShmCache\Memory( $desiredSize );
+      $this->stats = new ShmCache\Stats( $this->memory );
+    }
+    catch ( \Exception $e ) {
+      $this->locks::$everything->releaseWrite();
+      throw $e;
+    }
 
     if ( !$this->locks::$everything->releaseWrite() )
       throw new \Exception( 'Could not release a lock' );
@@ -199,8 +205,10 @@ class ShmCache {
       return false;
 
     $bucketLock = $this->locks->getBucketLock( $this->memory->getBucketIndex( $key ) );
-    if ( !$bucketLock->lockForWrite() )
+    if ( !$bucketLock->lockForWrite() ) {
+      $this->locks::$everything->releaseRead();
       return false;
+    }
 
     $value = $this->_get( $key, $retIsSerialized, $retIsCacheHit );
     if ( $retIsSerialized )
@@ -212,6 +220,7 @@ class ShmCache {
     else if ( !is_numeric( $value ) ) {
       trigger_error( 'Item "'. $key .'" value is not numeric' );
       $bucketLock->releaseWrite();
+      $this->locks::$everything->releaseRead();
       return false;
     }
 

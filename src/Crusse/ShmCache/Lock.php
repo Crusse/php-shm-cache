@@ -57,7 +57,8 @@ class Lock {
       return true;
     }
 
-    // This will block until there are no readers and writers with a lock
+    // This will block until there are no readers and writers with a lock,
+    // unless $try is true, in which case returns immediately
     $ret = flock( $this->lockFile, LOCK_EX|( $try ? LOCK_NB : 0 ) );
 
     if ( $ret )
