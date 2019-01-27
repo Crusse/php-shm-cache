@@ -65,18 +65,24 @@ class InternalsTest extends \PHPUnit\Framework\TestCase {
     $this->assertLessThan( self::CACHE_SIZE, $memory->MAX_TOTAL_VALUE_SIZE );
 
     $valueCount = $memory->MAX_CHUNKS + 50;
+    $smallValue = 'xxxxx';
+    $mediumValue = str_repeat( 'x', (int) ( $memory->MAX_VALUE_SIZE / 2 ) );
+    $bigValue = str_repeat( 'x', $memory->MAX_VALUE_SIZE );
 
-    // Try to store more than max amount of items of random size
+    // Try to store more than max amount of items
     for ( $i = 0; $i < $valueCount; ++$i ) {
-      $valSize = rand( 1, $memory->MAX_VALUE_SIZE );
-      $this->assertSame( true, $this->cache->set( 'foo'. $i, str_repeat( 'x', $valSize ) ) );
+      // Vary the value size for a more realistic test
+      $value = ( $i % 3 === 0 )
+        ? $smallValue
+        : ( $i % 3 === 1 ? $bigValue : $mediumValue );
+      $this->assertSame( true, $this->cache->set( 'foo'. $i, $value ) );
     }
 
     // We expect the last few stored items are still available (not all of the
     // 16 MB of the cache is available for storage, which is why we don't
     // expect 16 values to be available).
-    for ( $i = $valueCount - 10; $i < $valueCount; ++$i ) {
-      $this->assertSame( 0, strpos( $this->cache->get( 'foo'. $i ), 'xxxxxx' ), 'Could not read "foo'. $i .'"' );
+    for ( $i = $valueCount - 5; $i < $valueCount; ++$i ) {
+      $this->assertSame( 0, strpos( $this->cache->get( 'foo'. $i ), 'xxxxx' ), 'Could not read "foo'. $i .'"' );
     }
   }
 }

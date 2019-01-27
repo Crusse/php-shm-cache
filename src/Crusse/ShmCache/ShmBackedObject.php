@@ -7,11 +7,11 @@ namespace Crusse\ShmCache;
  */
 class ShmBackedObject {
 
-  public $_memory;
+  public $_memory; // MemoryArea
   public $_startOffset; // Relative to MemoryArea start
-  public $_size;
+  public $_size; // int
   public $_endOffset; // Relative to MemoryArea start
-  public $_properties;
+  public $_properties; // array
 
   // Prevent direct instantiation
   final private function __construct() {}
