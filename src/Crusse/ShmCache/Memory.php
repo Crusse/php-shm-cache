@@ -383,13 +383,15 @@ class Memory {
 
     $nextChunkOffset = $chunk->_endOffset + $chunk->valallocsize;
     $zoneMeta = $this->getZoneMetaForChunk( $chunk );
+    $zoneFreeChunkOffset = $this->getZoneFreeChunkOffset( $zoneMeta );
 
     // This is the top chunk in the zone's chunk stack. Adjust the zone's chunk
     // stack pointer.
-    if ( $this->getZoneFreeChunkOffset( $zoneMeta ) === $nextChunkOffset )
+    if ( $zoneFreeChunkOffset === $nextChunkOffset || $zoneFreeChunkOffset === 0 )
       $zoneMeta->usedspace -= $chunk->_size + $chunk->valallocsize;
 
     assert( $zoneMeta->usedspace >= 0 );
+    assert( $zoneMeta->usedspace <= $this->MAX_CHUNK_SIZE );
 
     $ret = true;
 
@@ -707,7 +709,7 @@ class Memory {
   }
 
   /**
-   * @return int A chunk offset relative to the zones area
+   * @return int A chunk offset relative to the zonesArea
    */
   private function getBucketHeadChunkOffset( $bucketIndex ) {
 
@@ -885,7 +887,7 @@ class Memory {
 
     $ret = false;
     $bucketLock = null;
-    $lastPossibleChunkOffset = $zoneMeta->_startOffset + self::ZONE_SIZE - $this->MIN_CHUNK_SIZE;
+    $lastPossibleChunkOffset = $this->lastAllowedChunkOffsetInZone( $zoneMeta );
     $chunk = $firstChunk = $this->getChunkByOffset( $zoneMeta->_endOffset );
 
     while ( true ) {
@@ -948,6 +950,7 @@ class Memory {
     $zoneMeta->usedspace = 0;
 
     assert( $zoneMeta->usedspace === 0 );
+    assert( $this->getZoneFreeSpace( $zoneMeta ) === $this->MAX_CHUNK_SIZE );
 
     $ret = true;
 
@@ -1010,7 +1013,7 @@ class Memory {
   }
 
   /**
-   * @param int $chunkOffset Offset relative to the zones area
+   * @param int $chunkOffset Offset relative to the zonesArea
    *
    * @return ShmBackedObject
    */
@@ -1040,7 +1043,7 @@ class Memory {
   }
 
   /**
-   * @param int $offset Relative to the zones area start
+   * @param int $offset Relative to the zonesArea start
    */
   private function getZoneIndexForOffset( $offset ) {
     assert( $offset >= 0 );
@@ -1063,13 +1066,14 @@ class Memory {
   }
 
   /**
-   * Returns the offset of the zone's chunk stack pointer relative to the zones
-   * area start -- i.e. returns the offset to the start of free chunk space in
-   * the given zone.
+   * Returns the offset of the chunks area stack pointer of the zone. The stack
+   * pointer points to the first free chunk in the zone.
    *
    * Returns 0 if there's no free chunk space in the zone.
    *
    * You must hold a zone lock when calling this.
+   *
+   * @return int Offset relative to the zonesArea
    */
   private function getZoneFreeChunkOffset( ShmBackedObject $zoneMeta ) {
 
@@ -1089,9 +1093,13 @@ class Memory {
 
     // $freeChunkOffset points to the given zone. Make sure it doesn't point
     // any further than the last allowed chunk offset in this zone.
-    assert( $freeChunkOffset <= $zoneMeta->_endOffset + $this->MAX_CHUNK_SIZE - $this->MIN_CHUNK_SIZE );
+    assert( $freeChunkOffset <= $this->lastAllowedChunkOffsetInZone( $zoneMeta ) );
 
     return $freeChunkOffset;
+  }
+
+  private function lastAllowedChunkOffsetInZone( ShmBackedObject $zoneMeta ) {
+    return $zoneMeta->_startOffset + self::ZONE_SIZE - $this->MIN_CHUNK_SIZE;
   }
 }
 

@@ -12,6 +12,9 @@ class ParallelismTest extends \PHPUnit\Framework\TestCase {
 
     $this->cache = new \Crusse\ShmCache( 16 * 1024 * 1024 );
     $this->assertSame( true, $this->cache->flush() );
+
+    // In case of infinite loops due to deadlocks etc.
+    set_time_limit( 30 );
   }
 
   function tearDown() {
