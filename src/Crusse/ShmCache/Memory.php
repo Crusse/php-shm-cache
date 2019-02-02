@@ -9,66 +9,7 @@ namespace Crusse\ShmCache;
  * allocate only the maximum of each instance's desired amount of memory, and
  * no more.
  *
- * Memory block structure
- * ----------------------
- *
- * Metadata area:
- * [oldestzoneindex]
- *
- *     The item count is the amount of currently stored items.
- *
- *     The oldestzoneindex points to the oldest zone in the zones area.
- *     When the cache is full, the oldest zone is evicted.
- *
- * Stats area:
- * [gethits][getmisses]
- *
- * Hash table bucket area:
- * [itemmetaoffset,itemmetaoffset,...]
- *
- *     Our hash table uses "separate chaining". The itemmetaoffset points to
- *     a chunk in a zone's chunksarea.
- *
- * Zones area:
- * [[usedspace,chunksarea],[usedspace,chunksarea],...]
- *
- *     The zones area is a ring buffer. The oldestzoneindex points to
- *     the oldest zone. Each zone is a stack of chunks.
- *
- *     A zone's usedspace can be used to calculate the first free chunk in
- *     that zone. All chunks up to that point is memory in use; all chunks
- *     after that point is free space. usedspace is therefore essentially
- *     a stack pointer.
- *
- *     Each zone is roughly in the order in which the zones were created, so
- *     that we can easily find the oldest zones for eviction, to make space for
- *     new cache items.
- *
- *     Each chunk contains a single cache item. A chunksarea looks like this:
- *
- * Chunks area:
- * [[key,hashnext,valallocsize,valsize,flags,value],...]
- *
- *     'key' is the hash table key as a string.
- *
- *     'hashnext' is the offset (in the zone area) of the next chunk in
- *     the current hash table bucket. If 0, it's the last entry in the bucket.
- *     This is used to traverse the entries in a hash table bucket, which is
- *     a linked list.
- *
- *     If 'valsize' is 0, that value slot is free. This doesn't mean that all
- *     the next chunks in this zone are free as well -- only the zone's usedspace
- *     (i.e. its stack pointer) tells where the zone's free area starts.
- *
- *     'valallocsize' is how big the allocated size is. This is usually the
- *     same as 'valsize', but can be larger if the value was replaced with
- *     a smaller value later, or if 'valsize' < MIN_VALUE_ALLOC_SIZE.
- *
- *     To traverse a single zone's chunks from left to right, keep incrementing
- *     your offset by chunkSize.
- *
- *     CHUNK_META_SIZE = MAX_KEY_LENGTH + sizeof(hashnext) + sizeof(valallocsize) + sizeof(valsize) + sizeof(flags)
- *     chunkSize = CHUNK_META_SIZE + valallocsize
+ * See LOCKING.md for information about the memory structure and locking.
  */
 class Memory {
 
@@ -874,8 +815,8 @@ class Memory {
   }
 
   /**
-   * You must hold a zone lock when calling this.
-   * TODO: or does this method handle all zone locking by itself?
+   * You must hold a zone lock and the oldestZoneIndex lock when calling this.
+   * TODO: or should this method handle all zone locking by itself?
    */
   private function removeAllChunksInZone( ShmBackedObject $zoneMeta ) {
 
@@ -909,13 +850,16 @@ class Memory {
           $zoneLock->releaseWrite();
           $zoneLock = null;
 
-          // TODO: according to LOCKING.txt the ringBufferPtr lock also needs
-          // to be unlocked here
+          $this->locks::$oldestZoneIndex->releaseWrite();
 
           if ( microtime( true ) - $startTime > self::TRYLOCK_TIMEOUT ) {
             trigger_error( 'Try-lock timeout' );
+            $bucketLock = null;
             goto cleanup;
           }
+
+          if ( !$this->locks::$oldestZoneIndex->lockForWrite() )
+            goto cleanup;
 
           $zoneLock = $this->locks->getZoneLock( $zoneIndex );
 

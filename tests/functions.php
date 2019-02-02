@@ -33,7 +33,7 @@ function mutex_test_func( $arg ) {
 function set_random_cache_values( $key ) {
 
   $cache = new \Crusse\ShmCache;
-  $value = str_repeat( 'x', rand( 1, 1024 ) );
+  $value = str_repeat( 'x', rand( 1, 1024 * 768 ) );
   $cache->set( $key, $value );
 
   return $value;
@@ -42,7 +42,7 @@ function set_random_cache_values( $key ) {
 function add_and_set_random_cache_values( $key ) {
 
   $cache = new \Crusse\ShmCache;
-  $value = str_repeat( 'x', rand( 1, 1024 ) );
+  $value = str_repeat( 'x', rand( 1, 1024 * 768 ) );
   $cache->add( $key, $value );
   $cache->set( $key, $value );
 
