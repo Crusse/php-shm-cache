@@ -11,6 +11,13 @@ class Lock {
 
   private static $registeredTags = [];
 
+  // If true, illegal lock operations will throw exceptions. See LOCKING.md for
+  // the locking rules. This should only be used in development as it's slow.
+  private static $validateLockRules = false;
+  // This PHP process's lock count per lock tag. Used only if validateLockRules
+  // is true.
+  private static $lockCountPerTag = null;
+
   private $readLockCount = 0;
   private $writeLockCount = 0;
   private $tag;
@@ -35,6 +42,20 @@ class Lock {
     self::$registeredTags[ $tag ] = true;
     $this->tag = $tag;
 
+    if ( getenv( 'SHMCACHE_VALIDATE_LOCK_RULES' ) || defined( 'SHMCACHE_VALIDATE_LOCK_RULES' ) ) {
+      self::$validateLockRules = true;
+
+      if ( self::$lockCountPerTag === null ) {
+        self::$lockCountPerTag = [
+          'everything' => 0,
+          'bucket' => 0,
+          'oldestzoneindex' => 0,
+          'zone' => 0,
+          'stats' => 0,
+        ];
+      }
+    }
+
     $this->initLockFiles();
   }
 
@@ -46,9 +67,10 @@ class Lock {
 
   function lockForWrite( $try = false ) {
 
-    if ( $this->readLockCount ) {
-      trigger_error( 'Tried to acquire "'. $this->tag .'" write lock even though a read lock is already acquired' );
-      return false;
+    if ( self::$validateLockRules ) {
+      if ( $this->readLockCount )
+        throw new \Exception( 'Tried to acquire "'. $this->tag .'" write lock even though a read lock is already acquired' );
+      $this->validateLockOperation( $try );
     }
 
     // Allow nested write locks
@@ -71,9 +93,10 @@ class Lock {
 
   function releaseWrite() {
 
-    if ( $this->readLockCount ) {
-      trigger_error( 'Tried to release a "'. $this->tag .'" write lock while having a read lock' );
-      return false;
+    if ( self::$validateLockRules ) {
+      if ( $this->readLockCount )
+        throw new \Exception( 'Tried to release a "'. $this->tag .'" write lock while having a read lock' );
+      $this->validateReleaseOperation();
     }
 
     // Allow nested write locks
@@ -81,9 +104,8 @@ class Lock {
       --$this->writeLockCount;
       return true;
     }
-    else if ( $this->writeLockCount <= 0 ) {
-      trigger_error( 'Tried to release non-existent "'. $this->tag .'" write lock' );
-      return false;
+    else if ( self::$validateLockRules && $this->writeLockCount <= 0 ) {
+      throw new \Exception( 'Tried to release non-existent "'. $this->tag .'" write lock' );
     }
 
     $ret = flock( $this->lockFile, LOCK_UN );
@@ -98,9 +120,10 @@ class Lock {
 
   function lockForRead( $try = false ) {
 
-    if ( $this->writeLockCount ) {
-      trigger_error( 'Tried to acquire "'. $this->tag .'" read lock even though a write lock is already acquired' );
-      return false;
+    if ( self::$validateLockRules ) {
+      if ( $this->writeLockCount )
+        throw new \Exception( 'Tried to acquire "'. $this->tag .'" read lock even though a write lock is already acquired' );
+      $this->validateLockOperation( $try );
     }
 
     // Allow nested read locks
@@ -121,9 +144,10 @@ class Lock {
 
   function releaseRead() {
 
-    if ( $this->writeLockCount ) {
-      trigger_error( 'Tried to release "'. $this->tag .'" write lock while having a read lock' );
-      return false;
+    if ( self::$validateLockRules ) {
+      if ( $this->writeLockCount )
+        throw new \Exception( 'Tried to release a "'. $this->tag .'" read lock while having a write lock' );
+      $this->validateReleaseOperation();
     }
 
     // Allow nested read locks
@@ -131,9 +155,8 @@ class Lock {
       --$this->readLockCount;
       return true;
     }
-    else if ( $this->readLockCount <= 0 ) {
-      trigger_error( 'Tried to release non-existent "'. $this->tag .'" read lock' );
-      return false;
+    else if ( self::$validateLockRules && $this->readLockCount <= 0 ) {
+      throw new \Exception( 'Tried to release non-existent "'. $this->tag .'" read lock' );
     }
 
     $ret = flock( $this->lockFile, LOCK_UN );
@@ -151,6 +174,85 @@ class Lock {
 
   function isLocked() {
     return (bool) ( $this->readLockCount + $this->writeLockCount );
+  }
+
+  private function validateLockOperation( $tryLock ) {
+
+    // Remove the individual zone's or bucket's index from the tag, so that we
+    // can track how many zone or bucket locks we have
+    $tag = preg_replace( '#^(bucket|zone)\d+$#', '$1', $this->tag );
+
+    if ( $tag === 'everything' ) {
+
+      // Must hold no locks on anything else, not even 'everything'
+      if ( self::$lockCountPerTag[ 'everything' ] !== 0 ||
+        self::$lockCountPerTag[ 'bucket' ] !== 0 ||
+        self::$lockCountPerTag[ 'oldestzoneindex' ] !== 0 ||
+        self::$lockCountPerTag[ 'zone' ] !== 0 )
+      {
+        $this->throwLockingRuleException( $tryLock );
+      }
+    }
+    else if ( $tag === 'bucket' ) {
+
+      // Rule 1
+      if ( self::$lockCountPerTag[ 'everything' ] === 0 )
+        $this->throwLockingRuleException( $tryLock );
+
+      // Rule 6
+      if ( self::$lockCountPerTag[ 'bucket' ] !== 0 && !$tryLock )
+        $this->throwLockingRuleException( $tryLock );
+
+      // Rules 4 and 7
+      if ( ( self::$lockCountPerTag[ 'oldestzoneindex' ] !== 0 ||
+        self::$lockCountPerTag[ 'zone' ] !== 0 ) &&
+        !$tryLock )
+      {
+        $this->throwLockingRuleException( $tryLock );
+      }
+    }
+    else if ( $tag === 'oldestzoneindex' ) {
+
+      if ( self::$lockCountPerTag[ 'oldestzoneindex' ] !== 0 )
+        $this->throwLockingRuleException( $tryLock );
+
+      // Rule 1
+      if ( self::$lockCountPerTag[ 'everything' ] === 0 )
+        $this->throwLockingRuleException( $tryLock );
+
+      // Rules 4 and 7
+      if ( self::$lockCountPerTag[ 'zone' ] !== 0 )
+        $this->throwLockingRuleException( $tryLock );
+    }
+    else if ( $tag === 'zone' ) {
+
+      // Rule 1
+      if ( self::$lockCountPerTag[ 'everything' ] === 0 )
+        $this->throwLockingRuleException( $tryLock );
+
+      // Rule 5
+      if ( self::$lockCountPerTag[ 'zone' ] !== 0 )
+        $this->throwLockingRuleException( $tryLock );
+    }
+
+    self::$lockCountPerTag[ $tag ]++;
+  }
+
+  private function validateReleaseOperation() {
+
+    // Remove the individual zone's or bucket's index from the tag, so that we
+    // can track how many zone or bucket locks we have
+    $tag = preg_replace( '#^(bucket|zone)\d+$#', '', $this->tag );
+
+    self::$lockCountPerTag[ $tag ]--;
+
+    if ( self::$lockCountPerTag < 0 )
+      throw new \Exception( 'Lock count for tag "'. $tag .'" is less than 0' );
+  }
+
+  private function throwLockingRuleException( $tryLock ) {
+
+    throw new \Exception( 'Tried to lock "'. $this->tag .'" but this violates the locking rules. Try-lock: '. var_export( $tryLock, true ) .'. Locks already held: '. var_export( self::$lockCountPerTag, true ) );
   }
 
   private function getLockFilePath() {
@@ -183,8 +285,9 @@ class Lock {
     if ( $this->lockFile )
       fclose( $this->lockFile );
 
-    $lockFile = $this->getLockFilePath();
-    unlink( $lockFile );
+    $path = $this->getLockFilePath();
+    if ( file_exists( $path ) )
+      unlink( $path );
   }
 }
 

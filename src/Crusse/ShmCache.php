@@ -83,8 +83,10 @@ class ShmCache {
       return false;
 
     $bucketLock = $this->locks->getBucketLock( $this->memory->getBucketIndex( $key ) );
-    if ( !$bucketLock->lockForWrite() )
+    if ( !$bucketLock->lockForWrite() ) {
+      $this->locks::$everything->releaseRead();
       return false;
+    }
 
     $ret = $this->_set( $key, $value, $retIsSerialized );
 
@@ -105,8 +107,10 @@ class ShmCache {
       return false;
 
     $bucketLock = $this->locks->getBucketLock( $this->memory->getBucketIndex( $key ) );
-    if ( !$bucketLock->lockForRead() )
+    if ( !$bucketLock->lockForRead() ) {
+      $this->locks::$everything->releaseRead();
       return false;
+    }
 
     $ret = $this->_get( $key, $retIsSerialized, $retIsCacheHit );
 
@@ -135,8 +139,10 @@ class ShmCache {
       return false;
 
     $bucketLock = $this->locks->getBucketLock( $this->memory->getBucketIndex( $key ) );
-    if ( !$bucketLock->lockForRead() )
+    if ( !$bucketLock->lockForRead() ) {
+      $this->locks::$everything->releaseRead();
       return false;
+    }
 
     $ret = (bool) $this->memory->getChunkByKey( $key );
 
@@ -158,8 +164,10 @@ class ShmCache {
       return false;
 
     $bucketLock = $this->locks->getBucketLock( $this->memory->getBucketIndex( $key ) );
-    if ( !$bucketLock->lockForWrite() )
+    if ( !$bucketLock->lockForWrite() ) {
+      $this->locks::$everything->releaseRead();
       return false;
+    }
 
     $ret = $this->_set( $key, $value, $retIsSerialized, true );
 
@@ -181,8 +189,10 @@ class ShmCache {
       return false;
 
     $bucketLock = $this->locks->getBucketLock( $this->memory->getBucketIndex( $key ) );
-    if ( !$bucketLock->lockForWrite() )
+    if ( !$bucketLock->lockForWrite() ) {
+      $this->locks::$everything->releaseRead();
       return false;
+    }
 
     $ret = $this->_set( $key, $value, $retIsSerialized, false, true );
 
@@ -256,8 +266,10 @@ class ShmCache {
       return false;
 
     $bucketLock = $this->locks->getBucketLock( $this->memory->getBucketIndex( $key ) );
-    if ( !$bucketLock->lockForWrite() )
+    if ( !$bucketLock->lockForWrite() ) {
+      $this->locks::$everything->releaseRead();
       return false;
+    }
 
     $ret = false;
     $chunk = $this->memory->getChunkByKey( $key );
