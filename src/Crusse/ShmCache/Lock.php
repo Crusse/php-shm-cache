@@ -172,8 +172,12 @@ class Lock {
     return $ret;
   }
 
-  function isLocked() {
-    return (bool) ( $this->readLockCount + $this->writeLockCount );
+  function isLockedForRead() {
+    return (bool) ( $this->readLockCount || $this->writeLockCount );
+  }
+
+  function isLockedForWrite() {
+    return (bool) $this->writeLockCount;
   }
 
   private function validateLockOperation( $tryLock ) {
@@ -242,11 +246,11 @@ class Lock {
 
     // Remove the individual zone's or bucket's index from the tag, so that we
     // can track how many zone or bucket locks we have
-    $tag = preg_replace( '#^(bucket|zone)\d+$#', '', $this->tag );
+    $tag = preg_replace( '#^(bucket|zone)\d+$#', '$1', $this->tag );
 
     self::$lockCountPerTag[ $tag ]--;
 
-    if ( self::$lockCountPerTag < 0 )
+    if ( self::$lockCountPerTag[ $tag ] < 0 )
       throw new \Exception( 'Lock count for tag "'. $tag .'" is less than 0' );
   }
 

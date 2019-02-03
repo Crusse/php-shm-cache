@@ -42,11 +42,18 @@ class ParallelismTest extends \PHPUnit\Framework\TestCase {
       // Run the background jobs. Note that the JobServer logs background
       // worker errors to /var/log/syslog, not PHPUnit stdout, so check syslog
       // if this unit test fails.
-      $res = $server->getOrderedResults();
+      try {
+        $res = $server->getOrderedResults();
+      }
+      catch ( \Exception $e ) {
+        error_log( 'See /var/log/syslog for errors' );
+        throw $e;
+      }
 
       for ( $i = 0; $i < self::WORKER_JOBS; $i++ ) {
-        $value = $res[ $i ];
-        $this->assertSame( $value, $this->cache->get( 'job'. $i ), 'Reading cache key "job'. $i .'"' );
+        $jobValue = $res[ $i ];
+        $cacheValue = $this->cache->get( 'job'. $i );
+        $this->assertSame( true, $jobValue === $cacheValue, 'See /var/log/syslog for errors; the cache item "job'. $i .'" value is incorrect: '. var_export( $cacheValue, true ) );
       }
     }
   }
@@ -54,7 +61,7 @@ class ParallelismTest extends \PHPUnit\Framework\TestCase {
   function testParallelSetOfIdenticalKeys() {
 
     $handleWorkerResult = function( $result, $jobNumber, $total ) {
-      $this->assertEquals( true, preg_match( '#^x+$#', $this->cache->get( 'identicalkey' ) ) );
+      $this->assertEquals( true, preg_match( '#^x+$#', $this->cache->get( 'identicalkey' ) ), 'See /var/log/syslog for errors' );
     };
 
     // Iterate the test many times for a better chance to hit a possible
@@ -72,7 +79,13 @@ class ParallelismTest extends \PHPUnit\Framework\TestCase {
       // Run the background jobs. Note that the JobServer logs background
       // worker errors to /var/log/syslog, not PHPUnit stdout, so check syslog
       // if this unit test fails.
-      $server->getResults( $handleWorkerResult );
+      try {
+        $server->getResults( $handleWorkerResult );
+      }
+      catch ( \Exception $e ) {
+        error_log( 'See /var/log/syslog for errors' );
+        throw $e;
+      }
     }
   }
 }

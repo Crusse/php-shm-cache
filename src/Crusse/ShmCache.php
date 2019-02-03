@@ -274,13 +274,8 @@ class ShmCache {
     $ret = false;
     $chunk = $this->memory->getChunkByKey( $key );
 
-    if ( $chunk ) {
-      // Already free
-      if ( !$chunk->valsize )
-        $ret = true;
-      else
-        $ret = $this->memory->removeChunk( $chunk );
-    }
+    if ( $chunk )
+      $ret = $this->memory->removeChunk( $chunk );
 
     $bucketLock->releaseWrite();
     $this->locks::$everything->releaseRead();
