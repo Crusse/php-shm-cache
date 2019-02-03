@@ -145,4 +145,10 @@ your offset by chunkSize.
         P1: Do some operation on zone Y
         P1: UNLOCK zone Y
 
+- __RULE 8:__ unlocks can be done in any order without fear of deadlocks, as
+  long as the _locking_ order rules are followed. See
+  `https://yarchive.net/comp/linux/lock_ordering.html` for an example from
+  Torvalds: "The FACT is, that unlocks do not have to nest cleanly. That's
+  a rock solid *FACT*. The locking order matters, and the unlocking order does not."
+
 

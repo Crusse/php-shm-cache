@@ -1346,6 +1346,8 @@ Generic stuff I've learned so far:
   - Write out the locking order as two columns for two processes/threads
 - When you're designing locks, think of the resources that need to be protected.
   What _is_ a resource? A single "resource" might contain data in multiple places.
+- Guarding a shared resource with a lock is about _data ownership_. He who has
+  the lock owns the data.
 
 
 ##############################################################################

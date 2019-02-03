@@ -122,6 +122,8 @@ class Memory {
     //
     // You must hold a zone lock when reading from or writing to the
     // "valallocsize", "valsize" and "flags" properties of this object.
+    //
+    // TODO: is the lock stuff above entirely correct?
     $this->chunkProto = ShmBackedObject::createPrototype( $this->zonesArea, [
       'key' => [
         'size' => self::MAX_KEY_LENGTH,
@@ -199,7 +201,8 @@ class Memory {
   function addChunk( $key, $value, $valueSize, $valueIsSerialized ) {
 
     assert( $this->locks->getBucketLock( $this->getBucketIndex( $key ) )->isLockedForWrite() );
-    assert( $valueSize >= 0 );
+    // Even empty strings have a $valueSize > 0, because they're serialize()d
+    assert( $valueSize > 0 );
 
     if ( $valueSize > $this->MAX_VALUE_SIZE ) {
       trigger_error( 'Item "'. rawurlencode( $key ) .'" is too large ('. round( $valueSize / 1000, 2 ) .' KB) to cache' );
@@ -231,6 +234,8 @@ class Memory {
     // There is still space left in the newest zone for this value
     if ( $zoneFreeSpace >= $requiredSize ) {
 
+      $this->locks::$oldestZoneIndex->releaseWrite();
+
       $freeChunkOffset = $this->getZoneFreeChunkOffset( $zoneMeta );
       $freeChunk = $this->getChunkByOffset( $freeChunkOffset );
 
@@ -247,23 +252,29 @@ class Memory {
     else {
 
       // Unlock newest zone, so that we can lock the oldest zone (only one zone
-      // lock should be held at a time to prevent deadlocks)
+      // lock can be held at a time to prevent deadlocks)
       $zoneLock->releaseWrite();
       $zoneLock = null;
 
       $oldestZoneIndex = $this->getOldestZoneIndex();
-      $zoneMeta = $this->getZoneMetaByIndex( $oldestZoneIndex );
+      // Move the oldest zone forward by one, as we'll reserve the previously
+      // oldest to be the newest zone
+      $setOldestZoneIndex = $this->setOldestZoneIndex( $oldestZoneIndex + 1 );
 
+      $this->locks::$oldestZoneIndex->releaseWrite();
+
+      if ( !$setOldestZoneIndex )
+        goto cleanup;
+
+      $zoneMeta = $this->getZoneMetaByIndex( $oldestZoneIndex );
       $zoneLock = $this->locks->getZoneLock( $oldestZoneIndex );
+
       if ( !$zoneLock->lockForWrite() ) {
         $zoneLock = null;
         goto cleanup;
       }
 
       if ( !$this->removeAllChunksInZone( $zoneMeta ) )
-        goto cleanup;
-
-      if ( !$this->setOldestZoneIndex( $oldestZoneIndex + 1 ) )
         goto cleanup;
 
       $freeChunk = $this->getChunkByOffset( $this->getZoneFreeChunkOffset( $zoneMeta ) );
@@ -300,8 +311,6 @@ class Memory {
 
     if ( $zoneLock )
       $zoneLock->releaseWrite();
-
-    $this->locks::$oldestZoneIndex->releaseWrite();
 
     return $ret;
   }
@@ -582,7 +591,9 @@ class Memory {
       assert( $chunk->valallocsize <= $this->MAX_VALUE_SIZE );
     }
 
+    $this->locks::$oldestZoneIndex->lockForWrite();
     $this->setOldestZoneIndex( $this->ZONE_COUNT - 1 );
+    $this->locks::$oldestZoneIndex->releaseWrite();
   }
 
   private function getNewestZoneIndex() {
@@ -763,6 +774,8 @@ class Memory {
     assert( $this->locks->getBucketLock( $bucketIndex )->isLockedForWrite() );
     $bucketHeadChunkOffset = $this->getBucketHeadChunkOffset( $bucketIndex );
 
+    assert( $this->locks->getZoneLock( $this->getZoneIndexForOffset( $chunk->_startOffset ) )->isLockedForWrite() );
+
     if ( !$bucketHeadChunkOffset ) {
       trigger_error( 'The hash table bucket for key "'. rawurlencode( $chunk->key ) .'" is empty' );
       return false;
@@ -789,9 +802,12 @@ class Memory {
 
     $prevChunk = $this->getChunkByOffset( $prevChunkOffset );
 
-    //               ________________
-    //              |                v
-    // Link [prevChunk currentChunk nextChunk]
+    // TODO: do we need to lock $prevChunk's zone? We already have its bucket's
+    // lock.
+
+    //               _____________
+    //              |             v
+    // Link [$prevChunk $chunk $nextChunk]
     //
     $prevChunk->hashnext = $chunk->hashnext;
     $chunk->hashnext = 0;
@@ -802,11 +818,16 @@ class Memory {
   /**
    * Increases the chunk's valallocsize.
    *
-   * You must hold a bucket lock and a zone lock when calling this.
+   * You must hold a zone lock when calling this.
    */
   private function mergeChunkWithNextFreeChunks( ShmBackedObject $chunk ) {
 
+    // Chunk must be free if it's to be merged with other free chunks
+    assert( $chunk->valsize === 0 );
+
     $zoneIndex = $this->getZoneIndexForOffset( $chunk->_startOffset );
+
+    assert( $this->locks->getZoneLock( $zoneIndex )->isLockedForWrite() );
 
     $newAllocSize = $origAllocSize = $chunk->valallocsize;
     $nextChunkOffset = $chunk->_endOffset + $origAllocSize;
@@ -839,15 +860,14 @@ class Memory {
   }
 
   /**
-   * You must hold write locks for the zone and the oldestZoneIndex when
-   * calling this.
+   * You must hold a zone write lock when calling this.
    */
   private function removeAllChunksInZone( ShmBackedObject $zoneMeta ) {
 
-    // TODO: assert() that we have the right locks (in other functions, too)
-
     $zoneIndex = $this->getZoneIndexForOffset( $zoneMeta->_startOffset );
     $zoneLock = $this->locks->getZoneLock( $zoneIndex );
+
+    assert( $zoneLock->isLockedForWrite() );
 
     $ret = false;
     $bucketLock = null;
@@ -866,23 +886,23 @@ class Memory {
         $startTime = microtime( true );
 
         // Attempt to get a try-lock until a timeout. We use a try-lock rather
-        // than a regular lock to prevent a deadlock, as someone might have locked
-        // the bucket already, and is trying to lock the zone.
+        // than a regular lock to prevent a deadlock, as another process might
+        // have locked the bucket already, and is trying to lock the zone.
+        // Non-try-locks can only be used when locking in bucket -> zone order,
+        // not zone -> bucket order.
         while ( !$bucketLock->lockForWrite( true ) ) {
 
+          // $bucketLock is already locked by another process. We release our
+          // zone lock (to preserve the bucket -> zone locking order rule) and
+          // try locking the bucket again soon
           $zoneLock->releaseWrite();
           $zoneLock = null;
-
-          $this->locks::$oldestZoneIndex->releaseWrite();
 
           if ( microtime( true ) - $startTime > self::TRYLOCK_TIMEOUT ) {
             trigger_error( 'Try-lock timeout' );
             $bucketLock = null;
             goto cleanup;
           }
-
-          if ( !$this->locks::$oldestZoneIndex->lockForWrite() )
-            goto cleanup;
 
           $zoneLock = $this->locks->getZoneLock( $zoneIndex );
 
@@ -898,6 +918,7 @@ class Memory {
         $bucketLock->releaseWrite();
         $bucketLock = null;
 
+        // Free the chunk
         $chunk->valsize = 0;
       }
 
@@ -933,13 +954,12 @@ class Memory {
    * Split the chunk into two, if the difference between valsize and
    * valallocsize is large enough.
    *
-   * You must hold a bucket lock and a zone lock when calling this.
+   * You must hold a zone lock when calling this.
    */
   private function splitChunkForFreeSpace( ShmBackedObject $chunk ) {
 
     $zoneIndex = $this->getZoneIndexForOffset( $chunk->_startOffset );
     assert( $this->locks->getZoneLock( $zoneIndex )->isLockedForWrite() );
-    assert( $this->locks->getBucketLock( $this->getBucketIndex( $chunk->key ) )->isLockedForWrite() );
 
     $ret = false;
     $valSize = $chunk->valsize;

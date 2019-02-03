@@ -252,6 +252,9 @@ class Lock {
 
     if ( self::$lockCountPerTag[ $tag ] < 0 )
       throw new \Exception( 'Lock count for tag "'. $tag .'" is less than 0' );
+
+    // Note: due to locking rule 8 we don't check for the releasing order
+    // here, as locks can be safely released in any order
   }
 
   private function throwLockingRuleException( $tryLock ) {
