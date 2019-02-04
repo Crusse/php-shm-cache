@@ -86,9 +86,9 @@ your offset by chunkSize.
 #### Resources locked by locks
 
 - E: Everything lock
+- R: Ring buffer pointer (oldestzoneindex) lock
 - B: Bucket lock
 - Z: Zone lock
-- R: Ring buffer pointer (oldestzoneindex) lock
 
 ```
 
