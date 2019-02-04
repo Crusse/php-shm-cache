@@ -88,27 +88,27 @@ your offset by chunkSize.
 - E: Everything lock
 - B: Bucket lock
 - Z: Zone lock
-- R: Ring buffer point (oldestzoneindex) lock
+- R: Ring buffer pointer (oldestzoneindex) lock
 
 ```
 
- E B Z R |
+ E R B Z |
          | [Bucket]
- x x     | chunkoffset
+ x   x   | chunkoffset
          |
          | [Zone]
- x   x   | usedspace
+ x     x | usedspace
          |
          | [Chunk]
- x x x   | key
- x x x   | hashnext
- x   x   | valallocsize
- x   x   | valsize
- x   x   | flags
- x   x   | value
+ x   x x | key
+ x   x x | hashnext
+ x     x | valallocsize
+ x     x | valsize
+ x     x | flags
+ x     x | value
          |
          | [Metadata]
- x     x | oldestzoneindex
+ x x     | oldestzoneindex
 
 ```
 
