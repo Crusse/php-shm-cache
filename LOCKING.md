@@ -90,6 +90,7 @@ your offset by chunkSize.
 - Z: Zone lock
 - R: Ring buffer point (oldestzoneindex) lock
 
+
     E B Z R |
             | [Bucket]
     x x     | chunkoffset
