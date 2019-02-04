@@ -22,9 +22,9 @@ When the cache is full, the oldest zone is evicted.
 
 #### Hash table bucket area:
 
-    [itemmetaoffset,itemmetaoffset,...]
+    [chunkoffset,chunkoffset,...]
 
-Our hash table uses "separate chaining" (look it up). The 'itemmetaoffset'
+Our hash table uses "separate chaining" (look it up). The 'chunkoffset'
 points to a chunk in a zone's 'chunksarea'.
 
 #### Zones area:
@@ -82,6 +82,35 @@ your offset by chunkSize.
   locks a single zone and all chunks in it
 - __Zones area ring buffer lock:__
   locks the 'oldestzoneindex' ring buffer pointer
+
+#### Resources locked by locks
+
+- E: Everything lock
+- B: Bucket lock
+- Z: Zone lock
+- R: Ring buffer point (oldestzoneindex) lock
+
+    E B Z R |
+            | [Bucket]
+    x x     | chunkoffset
+            |
+            | [Zone]
+    x   x   | usedspace
+            |
+            | [Chunk]
+    x x x   | key
+    x x x   | hashnext
+    x   x   | valallocsize
+    x   x   | valsize
+    x   x   | flags
+    x   x   | value
+            |
+            | [Metadata]
+    x     x | oldestzoneindex
+
+TODO: create ShmBackedObject::validateLockRules($lockManager) so that we can
+make sure that the correct locks have been acquired when the ShmBackedObject's
+`__isset()`, `__get()` and `__set()` are called.
 
 
 ## Locking rules
