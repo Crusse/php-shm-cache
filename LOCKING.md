@@ -4,7 +4,7 @@ The locking implementation
 ## TODO
 
 - Fix locking bugs in the PHP code
-- Maybe implement a lock correctness validator like in https://www.kernel.org/doc/Documentation/locking/lockdep-design.txt
+- Create ShmBackedObject::validateLockRules($lockManager) so that we can make sure that the correct locks have been acquired when the ShmBackedObject's `__isset()`, `__get()` and `__set()` are called.
 
 
 ## Memory block structure
@@ -107,10 +107,6 @@ your offset by chunkSize.
             |
             | [Metadata]
     x     x | oldestzoneindex
-
-TODO: create ShmBackedObject::validateLockRules($lockManager) so that we can
-make sure that the correct locks have been acquired when the ShmBackedObject's
-`__isset()`, `__get()` and `__set()` are called.
 
 
 ## Locking rules
