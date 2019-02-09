@@ -165,19 +165,13 @@ class ShmBackedObject {
       }
     }
 
-    // TODO: currently this just checks if any zone lock is held, not that
-    // a _specific_ zone's lock is being held
     if ( in_array( 'zone', $this->_properties[ $propName ][ 'requiredlocks' ] ) ) {
-      $hasLock = false;
 
-      foreach ( self::$locks::$zoneLocks as $lock ) {
-        if ( ( $writing && $lock->isLockedForWrite() ) ||
-          ( !$writing && $lock->isLockedForRead() ) )
-        {
-          $hasLock = true;
-          break;
-        }
-      }
+      $zoneIndex = (int) floor( $this->_startOffset / Memory::ZONE_SIZE );
+      $lock = self::$locks->getZoneLock( $zoneIndex );
+      $hasLock = ( $writing )
+        ? $lock->isLockedForWrite()
+        : $lock->isLockedForRead();
 
       if ( !$hasLock ) {
         throw new \Exception( 'The correct zone lock is not held for "'. $propName .'" (writing: '. var_export( $writing, true ) .')' );

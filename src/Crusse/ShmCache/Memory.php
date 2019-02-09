@@ -144,6 +144,7 @@ class Memory {
       'key' => [
         'size' => self::MAX_KEY_LENGTH,
         'packformat' => 'A'. self::MAX_KEY_LENGTH,
+        // TODO
         'requiredlocks' => [ /* ??? 'bucket' ??? , */ 'zone' ],
       ],
       'hashnext' => [
@@ -221,7 +222,9 @@ class Memory {
    */
   function addChunk( $key, $value, $valueSize, $valueIsSerialized ) {
 
-    assert( $this->locks->getBucketLock( self::getBucketIndex( $key ) )->isLockedForWrite() );
+    $bucketIndex = self::getBucketIndex( $key );
+
+    assert( $this->locks->getBucketLock( $bucketIndex )->isLockedForWrite() );
     // Even empty strings have a $valueSize > 0, because they're serialize()d
     assert( $valueSize > 0 );
 
@@ -234,17 +237,17 @@ class Memory {
     $zoneLock = null;
 
     if ( !$this->locks::$oldestZoneIndex->lockForWrite() )
-      return false;
+      goto cleanup;
 
     $newestZoneIndex = $this->getNewestZoneIndex();
-    $zoneMeta = $this->getZoneMetaByIndex( $newestZoneIndex );
-
     $zoneLock = $this->locks->getZoneLock( $newestZoneIndex );
+
     if ( !$zoneLock->lockForWrite() ) {
       $zoneLock = null;
       goto cleanup;
     }
 
+    $zoneMeta = $this->getZoneMetaByIndex( $newestZoneIndex );
     $zoneFreeSpace = $this->getZoneFreeSpace( $zoneMeta );
     $requiredSize = $this->CHUNK_META_SIZE + $valueSize;
 
@@ -287,13 +290,14 @@ class Memory {
       if ( !$setOldestZoneIndex )
         goto cleanup;
 
-      $zoneMeta = $this->getZoneMetaByIndex( $oldestZoneIndex );
       $zoneLock = $this->locks->getZoneLock( $oldestZoneIndex );
 
       if ( !$zoneLock->lockForWrite() ) {
         $zoneLock = null;
         goto cleanup;
       }
+
+      $zoneMeta = $this->getZoneMetaByIndex( $oldestZoneIndex );
 
       if ( !$this->removeAllChunksInZone( $zoneMeta ) )
         goto cleanup;
@@ -313,11 +317,6 @@ class Memory {
     $freeChunk->hashnext = 0;
     $freeChunk->valsize = $valueSize;
 
-    if ( !$this->linkChunkToHashTable( $freeChunk ) ) {
-      trigger_error( 'Could not link chunk for key "'. $key .'" to hash table' );
-      goto cleanup;
-    }
-
     if ( !$this->splitChunkForFreeSpace( $freeChunk ) )
       goto cleanup;
 
@@ -326,12 +325,23 @@ class Memory {
     assert( $zoneMeta->usedspace > 0 );
     assert( $zoneMeta->usedspace <= $this->MAX_CHUNK_SIZE );
 
+    $zoneLock->releaseWrite();
+    $zoneLock = null;
+
+    if ( !$this->linkChunkToHashTable( $freeChunk->_startOffset, $bucketIndex ) ) {
+      trigger_error( 'Could not link chunk for key "'. $key .'" to hash table' );
+      goto cleanup;
+    }
+
     $ret = true;
 
     cleanup:
 
     if ( $zoneLock )
       $zoneLock->releaseWrite();
+
+    if ( $this->locks::$oldestZoneIndex->isLockedForWrite() )
+      $this->locks::$oldestZoneIndex->releaseWrite();
 
     return $ret;
   }
@@ -747,19 +757,24 @@ class Memory {
   /**
    * You must hold a bucket lock when calling this.
    */
-  private function linkChunkToHashTable( ShmBackedObject $chunk ) {
+  private function linkChunkToHashTable( $chunkOffset, $bucketIndex ) {
 
-    assert( $chunk->_startOffset > 0 );
-    assert( $chunk->_startOffset <= $this->zonesArea->size - $this->MIN_CHUNK_SIZE );
-
-    $bucketIndex = self::getBucketIndex( $chunk->key );
+    assert( $chunkOffset > 0 );
+    assert( $chunkOffset <= $this->zonesArea->size - $this->MIN_CHUNK_SIZE );
     assert( $this->locks->getBucketLock( $bucketIndex )->isLockedForWrite() );
+
     $existingChunkOffset = $this->getBucketHeadChunkOffset( $bucketIndex );
 
     if ( !$existingChunkOffset )
-      return $this->setBucketHeadChunkOffset( $bucketIndex, $chunk->_startOffset );
+      return $this->setBucketHeadChunkOffset( $bucketIndex, $chunkOffset );
 
+    // Find the tail of the bucket's linked list, and add this chunk to the end
     while ( $existingChunkOffset > 0 ) {
+
+      $zoneIndex = $this->getZoneIndexForOffset( $existingChunkOffset );
+      $zoneLock = $this->locks->getZoneLock( $zoneIndex );
+      if ( !$zoneLock->lockForWrite() )
+        return false;
 
       $existingChunk = $this->getChunkByOffset( $existingChunkOffset );
       $hashNext = $existingChunk->hashnext;
@@ -767,12 +782,15 @@ class Memory {
       if ( !$hashNext ) {
         // Check that we're not trying to link an already linked chunk to
         // the hash table
-        assert( $existingChunk->_startOffset !== $chunk->_startOffset );
+        assert( $existingChunk->_startOffset !== $chunkOffset );
 
-        $existingChunk->hashnext = $chunk->_startOffset;
+        $existingChunk->hashnext = $chunkOffset;
+        $zoneLock->releaseWrite();
+
         return true;
       }
 
+      $zoneLock->releaseWrite();
       $existingChunkOffset = $hashNext;
     }
 
@@ -783,6 +801,9 @@ class Memory {
    * You must hold a bucket lock and a zone lock when calling this.
    */
   private function unlinkChunkFromHashTable( ShmBackedObject $chunk ) {
+
+    // TODO: change the parameters to this function? $chunkOffset,
+    // $bucketIndex, $nextChunkOffset
 
     $bucketIndex = self::getBucketIndex( $chunk->key );
     assert( $this->locks->getBucketLock( $bucketIndex )->isLockedForWrite() );

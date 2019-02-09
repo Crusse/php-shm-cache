@@ -13,8 +13,8 @@ class LockManager {
   public static $stats;
   public static $oldestZoneIndex;
 
-  public static $bucketLocks = [];
-  public static $zoneLocks = [];
+  private static $bucketLocks = [];
+  private static $zoneLocks = [];
 
   // Prevent instantiation
   private function __construct() {}
