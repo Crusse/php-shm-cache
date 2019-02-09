@@ -1348,6 +1348,9 @@ Generic stuff I've learned so far:
   What _is_ a resource? A single "resource" might contain data in multiple places.
 - Guarding a shared resource with a lock is about _data ownership_. He who has
   the lock owns the data.
+- Your locks should be as long-lasting as possible (cover as much lines as possible)
+  for better understandability, as long as performance stays OK.
+  Longer critical sections -> more code behaves like a single-threaded program.
 
 
 ##############################################################################

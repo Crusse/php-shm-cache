@@ -13,9 +13,10 @@ class LockManager {
   public static $stats;
   public static $oldestZoneIndex;
 
-  private static $hashBucketLocks = [];
-  private static $zoneLocks = [];
+  public static $bucketLocks = [];
+  public static $zoneLocks = [];
 
+  // Prevent instantiation
   private function __construct() {}
 
   static function getInstance() {
@@ -43,10 +44,10 @@ class LockManager {
 
   function getBucketLock( $bucketIndex ) {
 
-    if ( !isset( self::$hashBucketLocks[ $bucketIndex ] ) )
-      self::$hashBucketLocks[ $bucketIndex ] = new Lock( 'bucket'. $bucketIndex );
+    if ( !isset( self::$bucketLocks[ $bucketIndex ] ) )
+      self::$bucketLocks[ $bucketIndex ] = new Lock( 'bucket'. $bucketIndex );
 
-    return self::$hashBucketLocks[ $bucketIndex ];
+    return self::$bucketLocks[ $bucketIndex ];
   }
 }
 

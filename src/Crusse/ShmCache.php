@@ -82,7 +82,7 @@ class ShmCache {
     if ( !$this->locks::$everything->lockForRead() )
       return false;
 
-    $bucketLock = $this->locks->getBucketLock( $this->memory->getBucketIndex( $key ) );
+    $bucketLock = $this->locks->getBucketLock( ShmCache\Memory::getBucketIndex( $key ) );
     if ( !$bucketLock->lockForWrite() ) {
       $this->locks::$everything->releaseRead();
       return false;
@@ -106,7 +106,7 @@ class ShmCache {
     if ( !$this->locks::$everything->lockForRead() )
       return false;
 
-    $bucketLock = $this->locks->getBucketLock( $this->memory->getBucketIndex( $key ) );
+    $bucketLock = $this->locks->getBucketLock( ShmCache\Memory::getBucketIndex( $key ) );
     if ( !$bucketLock->lockForRead() ) {
       $this->locks::$everything->releaseRead();
       return false;
@@ -138,7 +138,7 @@ class ShmCache {
     if ( !$this->locks::$everything->lockForRead() )
       return false;
 
-    $bucketLock = $this->locks->getBucketLock( $this->memory->getBucketIndex( $key ) );
+    $bucketLock = $this->locks->getBucketLock( ShmCache\Memory::getBucketIndex( $key ) );
     if ( !$bucketLock->lockForRead() ) {
       $this->locks::$everything->releaseRead();
       return false;
@@ -163,7 +163,7 @@ class ShmCache {
     if ( !$this->locks::$everything->lockForRead() )
       return false;
 
-    $bucketLock = $this->locks->getBucketLock( $this->memory->getBucketIndex( $key ) );
+    $bucketLock = $this->locks->getBucketLock( ShmCache\Memory::getBucketIndex( $key ) );
     if ( !$bucketLock->lockForWrite() ) {
       $this->locks::$everything->releaseRead();
       return false;
@@ -188,7 +188,7 @@ class ShmCache {
     if ( !$this->locks::$everything->lockForRead() )
       return false;
 
-    $bucketLock = $this->locks->getBucketLock( $this->memory->getBucketIndex( $key ) );
+    $bucketLock = $this->locks->getBucketLock( ShmCache\Memory::getBucketIndex( $key ) );
     if ( !$bucketLock->lockForWrite() ) {
       $this->locks::$everything->releaseRead();
       return false;
@@ -214,7 +214,7 @@ class ShmCache {
     if ( !$this->locks::$everything->lockForRead() )
       return false;
 
-    $bucketLock = $this->locks->getBucketLock( $this->memory->getBucketIndex( $key ) );
+    $bucketLock = $this->locks->getBucketLock( ShmCache\Memory::getBucketIndex( $key ) );
     if ( !$bucketLock->lockForWrite() ) {
       $this->locks::$everything->releaseRead();
       return false;
@@ -265,7 +265,7 @@ class ShmCache {
     if ( !$this->locks::$everything->lockForRead() )
       return false;
 
-    $bucketLock = $this->locks->getBucketLock( $this->memory->getBucketIndex( $key ) );
+    $bucketLock = $this->locks->getBucketLock( ShmCache\Memory::getBucketIndex( $key ) );
     if ( !$bucketLock->lockForWrite() ) {
       $this->locks::$everything->releaseRead();
       return false;
@@ -358,13 +358,12 @@ class ShmCache {
 
     if ( $chunk ) {
 
-      $data = $this->memory->getChunkValue( $chunk );
+      $data = $this->memory->getChunkValue( $chunk, $retIsSerialized );
 
       if ( $data === false ) {
         trigger_error( 'Could not read value for item "'. rawurlencode( $key ) .'"' );
       }
       else {
-        $retIsSerialized = $chunk->flags & ShmCache\Memory::FLAG_SERIALIZED;
         $retIsCacheHit = true;
         $ret = $data;
       }

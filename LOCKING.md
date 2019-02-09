@@ -1,11 +1,6 @@
 The locking implementation
 --------------------------
 
-## TODO
-
-- Fix locking bugs in the PHP code
-- Create ShmBackedObject::validateLockRules($lockManager) so that we can make sure that the correct locks have been acquired when the ShmBackedObject's `__isset()`, `__get()` and `__set()` are called.
-
 
 ## Memory block structure
 
@@ -87,12 +82,13 @@ your offset by chunkSize.
 
 - E: Everything lock
 - R: Ring buffer pointer (oldestzoneindex) lock
-- B: Bucket lock
-- Z: Zone lock
+- B: Bucket lock (locks the bucket head chunk pointer, and the nextchunk of all
+  chunks in the bucket)
+- Z: Zone lock (locks the zone metadata and all chunks in the zone)
 
 ```
 
- E R B Z |
+ E R B Z
          | [Bucket]
  x   x   | chunkoffset
          |
@@ -100,7 +96,7 @@ your offset by chunkSize.
  x     x | usedspace
          |
          | [Chunk]
- x   x x | key
+ x   ? x | key
  x   x x | hashnext
  x     x | valallocsize
  x     x | valsize
@@ -111,6 +107,15 @@ your offset by chunkSize.
  x x     | oldestzoneindex
 
 ```
+
+The x's here are ANDed. To modify `usedspace`, you need the Everything and Zone
+locks. To modify `hashnext`, you need Everything, Bucket and Zone locks.
+
+TODO: maybe exploit the "oldest zone" by ensuring that it always has only
+free'd chunks. Maybe this minimizes the amount of work that has to be done
+while holding a lock.
+
+TODO: fix zone locking in Memory.php (see TODOs in that file)
 
 
 ## Locking rules

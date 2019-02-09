@@ -13,6 +13,11 @@ class ShmBackedObject {
   public $_endOffset; // Relative to MemoryArea start
   public $_properties; // array
 
+  // If true, illegal lock operations will throw exceptions. See LOCKING.md for
+  // the locking rules. This should only be used in development as it's slow.
+  private static $validateLockRules = false;
+  private static $locks = null; // LockManager
+
   // Prevent direct instantiation
   final private function __construct() {}
 
@@ -34,6 +39,13 @@ class ShmBackedObject {
     $proto->_startOffset = 0;
     $proto->_size = $offsetTotal;
     $proto->_endOffset = $proto->_startOffset + $proto->_size;
+
+    if ( getenv( 'SHMCACHE_VALIDATE_LOCK_RULES' ) || defined( 'SHMCACHE_VALIDATE_LOCK_RULES' ) ) {
+      self::$validateLockRules = true;
+
+      if ( self::$locks === null )
+        self::$locks = LockManager::getInstance();
+    }
 
     return $proto;
   }
@@ -62,15 +74,41 @@ class ShmBackedObject {
   }
 
   function __isset( $name ) {
+
+    if ( self::$validateLockRules )
+      $this->validateLockingRules( $name, false );
+
     return isset( $this->_properties[ $name ] );
   }
 
   function __get( $name ) {
 
-    $prop = @$this->_properties[ $name ];
+    if ( self::$validateLockRules )
+      $this->validateLockingRules( $name, false );
+
+    return $this->readProperty( $name );
+  }
+
+  function __set( $name, $value ) {
+
+    if ( self::$validateLockRules )
+      $this->validateLockingRules( $name, true );
+
+    return $this->writeProperty( $name, $value );
+  }
+
+  function __unset( $name ) {
+    // We'll rely on __set()'s pack() to properly convert null into whatever bytes
+    // 'packformat' defines (e.g. 4 NUL bytes, 255 whitespace-padded chars, ...)
+    return $this->__set( $name, null );
+  }
+
+  private function readProperty( $propName ) {
+
+    $prop = @$this->_properties[ $propName ];
 
     if ( !isset( $prop ) )
-      throw new \Exception( $name .' does not exist' );
+      throw new \Exception( $propName .' does not exist' );
 
     $data = $this->_memory->read( $this->_startOffset + $prop[ 'offset' ], $prop[ 'size' ] );
 
@@ -80,17 +118,17 @@ class ShmBackedObject {
     return unpack( $prop[ 'packformat' ], $data )[ 1 ];
   }
 
-  function __set( $name, $value ) {
+  private function writeProperty( $propName, $value ) {
 
     // TODO: buffer writes until someone tries to read the memory. you'll need
     // to be careful that the object's memory is always read using this class,
     // and not directly with shmop_read(); maybe it's safest to add
     // an explicit "bufferWrites" bool property and a flushBuffer() method to this class.
 
-    $prop = @$this->_properties[ $name ];
+    $prop = @$this->_properties[ $propName ];
     
     if ( !isset( $prop ) )
-      throw new \Exception( $name .' does not exist' );
+      throw new \Exception( $propName .' does not exist' );
 
     $written = $this->_memory->write( $this->_startOffset + $prop[ 'offset' ], pack( $prop[ 'packformat' ], $value ) );
 
@@ -100,10 +138,65 @@ class ShmBackedObject {
     return true;
   }
 
-  function __unset( $name ) {
-    // We'll rely on __set()'s pack() to properly convert null into whatever bytes
-    // 'packformat' defines (e.g. 4 NUL bytes, 255 whitespace-padded chars, ...)
-    return $this->__set( $name, null );
+  private function validateLockingRules( $propName, $writing = false ) {
+
+    // All read and write operations against shared memory require the
+    // "everything" lock
+    if ( !self::$locks::$everything->isLockedForRead() )
+      throw new \Exception( 'All read and write operations require the "everything" lock' );
+
+    if ( in_array( 'bucket', $this->_properties[ $propName ][ 'requiredlocks' ] ) ) {
+
+      // This ShmBackedObject is a 'chunk' object
+      if ( isset( $this->_properties[ 'key' ] ) ) {
+        $key = $this->readProperty( 'key' );
+
+        // Only require a bucket lock if the key exists, i.e. the chunk is not free
+        if ( strlen( $key ) ) {
+          $lock = self::$locks->getBucketLock( Memory::getBucketIndex( $key ) );
+          $hasLock = ( $writing )
+            ? $lock->isLockedForWrite()
+            : $lock->isLockedForRead();
+
+          if ( !$hasLock ) {
+            throw new \Exception( 'The correct bucket lock is not held for "'. $key .'"->"'. $propName .'" (writing: '. var_export( $writing, true ) .')' );
+          }
+        }
+      }
+    }
+
+    // TODO: currently this just checks if any zone lock is held, not that
+    // a _specific_ zone's lock is being held
+    if ( in_array( 'zone', $this->_properties[ $propName ][ 'requiredlocks' ] ) ) {
+      $hasLock = false;
+
+      foreach ( self::$locks::$zoneLocks as $lock ) {
+        if ( ( $writing && $lock->isLockedForWrite() ) ||
+          ( !$writing && $lock->isLockedForRead() ) )
+        {
+          $hasLock = true;
+          break;
+        }
+      }
+
+      if ( !$hasLock ) {
+        throw new \Exception( 'The correct zone lock is not held for "'. $propName .'" (writing: '. var_export( $writing, true ) .')' );
+      }
+    }
+
+    if ( in_array( 'stats', $this->_properties[ $propName ][ 'requiredlocks' ] ) ) {
+      $hasLock = false;
+
+      if ( ( $writing && self::$locks::$stats->isLockedForWrite() ) ||
+        ( !$writing && self::$locks::$stats->isLockedForRead() ) )
+      {
+        $hasLock = true;
+      }
+
+      if ( !$hasLock ) {
+        throw new \Exception( 'The correct stats lock is not held for "'. $propName .'" (writing: '. var_export( $writing, true ) .')' );
+      }
+    }
   }
 }
 

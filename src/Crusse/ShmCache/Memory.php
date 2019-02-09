@@ -93,58 +93,79 @@ class Memory {
       $this->initializeMemBlock();
   }
 
+  /**
+   * Returns an index in the key hash table, to the first element of the
+   * hash table item cluster (i.e. bucket) for the given key.
+   *
+   *
+   * @return int
+   */
+  static function getBucketIndex( $key ) {
+
+    // Read as a 32-bit unsigned long
+    // TODO: unpack() is slow. Is there an alternative?
+    //
+    // The hash function must result in as uniform a distribution of bits
+    // as possible, over all the possible $key values. CRC32 looks pretty good:
+    // http://michiel.buddingh.eu/distribution-of-hash-values
+    //
+    return unpack( 'L', hash( 'crc32', $key, true ) )[ 1 ] % self::HASH_BUCKET_COUNT;
+  }
+
+  /**
+   * These are our objects that we store in the whole shared memory block. See
+   * LOCKING.md for the locks that you need to hold to read/write any of these
+   * object's properties.
+   */
   private function defineShmObjectPrototypes() {
 
-    // You must hold the stats lock when reading from or writing to any
-    // property of this object
     $this->statsProto = ShmBackedObject::createPrototype( $this->statsArea, [
       'gethits' => [
         'size' => $this->LONG_SIZE,
-        'packformat' => 'l'
+        'packformat' => 'l',
+        'requiredlocks' => [ 'stats' ],
       ],
       'getmisses' => [
         'size' => $this->LONG_SIZE,
-        'packformat' => 'l'
-      ]
+        'packformat' => 'l',
+        'requiredlocks' => [ 'stats' ],
+      ],
     ] );
 
-    // You must hold the zone's lock when reading from or writing to any
-    // property of this object
     $this->zoneMetaProto = ShmBackedObject::createPrototype( $this->zonesArea, [
       'usedspace' => [
         'size' => $this->LONG_SIZE,
-        'packformat' => 'l'
-      ]
+        'packformat' => 'l',
+        'requiredlocks' => [ 'zone' ],
+      ],
     ] );
 
-    // You must hold a bucket lock when reading from or writing to the
-    // "key" and "hashnext" properties of this object.
-    //
-    // You must hold a zone lock when reading from or writing to the
-    // "valallocsize", "valsize" and "flags" properties of this object.
-    //
-    // TODO: is the lock stuff above entirely correct?
     $this->chunkProto = ShmBackedObject::createPrototype( $this->zonesArea, [
       'key' => [
         'size' => self::MAX_KEY_LENGTH,
-        'packformat' => 'A'. self::MAX_KEY_LENGTH
+        'packformat' => 'A'. self::MAX_KEY_LENGTH,
+        'requiredlocks' => [ /* ??? 'bucket' ??? , */ 'zone' ],
       ],
       'hashnext' => [
         'size' => $this->LONG_SIZE,
-        'packformat' => 'l'
+        'packformat' => 'l',
+        'requiredlocks' => [ 'bucket', 'zone' ],
       ],
       'valallocsize' => [
         'size' => $this->LONG_SIZE,
-        'packformat' => 'l'
+        'packformat' => 'l',
+        'requiredlocks' => [ 'zone' ],
       ],
       'valsize' => [
         'size' => $this->LONG_SIZE,
-        'packformat' => 'l'
+        'packformat' => 'l',
+        'requiredlocks' => [ 'zone' ],
       ],
       'flags' => [
         'size' => $this->CHAR_SIZE,
-        'packformat' => 'c'
-      ]
+        'packformat' => 'c',
+        'requiredlocks' => [ 'zone' ],
+      ],
     ] );
   }
 
@@ -163,7 +184,7 @@ class Memory {
    */
   function getChunkByKey( $key ) {
 
-    $bucketIndex = $this->getBucketIndex( $key );
+    $bucketIndex = self::getBucketIndex( $key );
     assert( $this->locks->getBucketLock( $bucketIndex )->isLockedForRead() );
     $chunkOffset = $this->getBucketHeadChunkOffset( $bucketIndex );
 
@@ -200,7 +221,7 @@ class Memory {
    */
   function addChunk( $key, $value, $valueSize, $valueIsSerialized ) {
 
-    assert( $this->locks->getBucketLock( $this->getBucketIndex( $key ) )->isLockedForWrite() );
+    assert( $this->locks->getBucketLock( self::getBucketIndex( $key ) )->isLockedForWrite() );
     // Even empty strings have a $valueSize > 0, because they're serialize()d
     assert( $valueSize > 0 );
 
@@ -320,11 +341,11 @@ class Memory {
    */
   function removeChunk( ShmBackedObject $chunk ) {
 
-    assert( $this->locks->getBucketLock( $this->getBucketIndex( $chunk->key ) )->isLockedForWrite() );
-
     $zoneLock = $this->locks->getZoneLock( $this->getZoneIndexForOffset( $chunk->_startOffset ) );
     if ( !$zoneLock->lockForWrite() )
       return false;
+
+    assert( $this->locks->getBucketLock( self::getBucketIndex( $chunk->key ) )->isLockedForWrite() );
 
     $ret = false;
 
@@ -363,9 +384,16 @@ class Memory {
     return $ret;
   }
 
-  function getChunkValue( ShmBackedObject $chunk ) {
+  function getChunkValue( ShmBackedObject $chunk, &$retIsSerialized ) {
+
+    $zoneLock = $this->locks->getZoneLock( $this->getZoneIndexForOffset( $chunk->_startOffset ) );
+    if ( !$zoneLock->lockForRead() )
+      return false;
 
     $data = $this->zonesArea->read( $chunk->_endOffset, $chunk->valsize );
+    $retIsSerialized = $chunk->flags & self::FLAG_SERIALIZED;
+
+    $zoneLock->releaseRead();
 
     if ( $data === false ) {
       trigger_error( 'Could not read chunk value' );
@@ -404,25 +432,6 @@ class Memory {
     $zoneLock->releaseWrite();
 
     return $ret;
-  }
-
-  /**
-   * Returns an index in the key hash table, to the first element of the
-   * hash table item cluster (i.e. bucket) for the given key.
-   *
-   *
-   * @return int
-   */
-  function getBucketIndex( $key ) {
-
-    // Read as a 32-bit unsigned long
-    // TODO: unpack() is slow. Is there an alternative?
-    //
-    // The hash function must result in as uniform a distribution of bits
-    // as possible, over all the possible $key values. CRC32 looks pretty good:
-    // http://michiel.buddingh.eu/distribution-of-hash-values
-    //
-    return unpack( 'L', hash( 'crc32', $key, true ) )[ 1 ] % self::HASH_BUCKET_COUNT;
   }
 
   function flush() {
@@ -574,6 +583,9 @@ class Memory {
     // Initialize zones
     for ( $i = 0; $i < $this->ZONE_COUNT; $i++ ) {
 
+      $zoneLock = $this->locks->getZoneLock( $i );
+      $zoneLock->lockForWrite();
+
       $zoneMeta = $this->getZoneMetaByIndex( $i );
       $zoneMeta->usedspace = 0;
 
@@ -589,6 +601,8 @@ class Memory {
       assert( $zoneMeta->usedspace === 0 );
       assert( $chunk->valallocsize > 0 );
       assert( $chunk->valallocsize <= $this->MAX_VALUE_SIZE );
+
+      $zoneLock->releaseWrite();
     }
 
     $this->locks::$oldestZoneIndex->lockForWrite();
@@ -659,7 +673,7 @@ class Memory {
    */
   private function findHashTablePrevChunkOffset( ShmBackedObject $chunk, $bucketHeadChunkOffset ) {
 
-    assert( $this->locks->getBucketLock( $this->getBucketIndex( $chunk->key ) )->isLockedForRead() );
+    assert( $this->locks->getBucketLock( self::getBucketIndex( $chunk->key ) )->isLockedForRead() );
 
     $chunkOffset = $chunk->_startOffset;
     $currentOffset = $bucketHeadChunkOffset;
@@ -738,7 +752,7 @@ class Memory {
     assert( $chunk->_startOffset > 0 );
     assert( $chunk->_startOffset <= $this->zonesArea->size - $this->MIN_CHUNK_SIZE );
 
-    $bucketIndex = $this->getBucketIndex( $chunk->key );
+    $bucketIndex = self::getBucketIndex( $chunk->key );
     assert( $this->locks->getBucketLock( $bucketIndex )->isLockedForWrite() );
     $existingChunkOffset = $this->getBucketHeadChunkOffset( $bucketIndex );
 
@@ -770,7 +784,7 @@ class Memory {
    */
   private function unlinkChunkFromHashTable( ShmBackedObject $chunk ) {
 
-    $bucketIndex = $this->getBucketIndex( $chunk->key );
+    $bucketIndex = self::getBucketIndex( $chunk->key );
     assert( $this->locks->getBucketLock( $bucketIndex )->isLockedForWrite() );
     $bucketHeadChunkOffset = $this->getBucketHeadChunkOffset( $bucketIndex );
 
@@ -882,7 +896,7 @@ class Memory {
       // Not already freed
       if ( $chunk->valsize ) {
 
-        $bucketLock = $this->locks->getBucketLock( $this->getBucketIndex( $chunk->key ) );
+        $bucketLock = $this->locks->getBucketLock( self::getBucketIndex( $chunk->key ) );
         $startTime = microtime( true );
 
         // Attempt to get a try-lock until a timeout. We use a try-lock rather
