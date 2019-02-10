@@ -9,14 +9,14 @@ namespace Crusse\ShmCache;
  */
 class Lock {
 
-  private static $registeredTags = [];
+  // This PHP process's lock count per lock tag. Used only if validateLockRules
+  // is true.
+  public static $lockCountPerTag = null;
 
+  private static $registeredTags = [];
   // If true, illegal lock operations will throw exceptions. See LOCKING.md for
   // the locking rules. This should only be used in development as it's slow.
   private static $validateLockRules = false;
-  // This PHP process's lock count per lock tag. Used only if validateLockRules
-  // is true.
-  private static $lockCountPerTag = null;
 
   private $readLockCount = 0;
   private $writeLockCount = 0;
@@ -104,9 +104,9 @@ class Lock {
       --$this->writeLockCount;
       return true;
     }
-    else if ( self::$validateLockRules && $this->writeLockCount <= 0 ) {
+
+    if ( self::$validateLockRules && $this->writeLockCount <= 0 )
       throw new \Exception( 'Tried to release non-existent "'. $this->tag .'" write lock' );
-    }
 
     $ret = flock( $this->lockFile, LOCK_UN );
 
@@ -155,9 +155,9 @@ class Lock {
       --$this->readLockCount;
       return true;
     }
-    else if ( self::$validateLockRules && $this->readLockCount <= 0 ) {
+
+    if ( self::$validateLockRules && $this->readLockCount <= 0 )
       throw new \Exception( 'Tried to release non-existent "'. $this->tag .'" read lock' );
-    }
 
     $ret = flock( $this->lockFile, LOCK_UN );
 

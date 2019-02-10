@@ -96,7 +96,7 @@ your offset by chunkSize.
  x     x | usedspace
          |
          | [Chunk]
- x   ? x | key
+ x   w x | key
  x   x x | hashnext
  x     x | valallocsize
  x     x | valsize
@@ -111,11 +111,43 @@ your offset by chunkSize.
 The x's here are ANDed. To modify `usedspace`, you need the Everything and Zone
 locks. To modify `hashnext`, you need Everything, Bucket and Zone locks.
 
+`Chunk->key` is a special case: a Bucket lock needs to be only held when
+writing to `key`, and only when `key` is not empty (i.e. the chunk is not free).
+When reading `key`, only Everything and Zone locks are needed.
+
 TODO: maybe exploit the "oldest zone" by ensuring that it always has only
 free'd chunks. Maybe this minimizes the amount of work that has to be done
 while holding a lock.
 
 TODO: fix zone locking in Memory.php (see TODOs in that file)
+
+
+
+
+add:
+get bucket index for key
+LOCK BUCKET
+LOCK RBP
+read newest zone
+UNLOCK RBP
+LOCK ZONE
+find free chunk
+write chunk data
+link to hash table
+  LOCK ZONE(S)
+
+
+```
+
+X X X X X X X
+|
+|___
+    |
+Z Z Z Z Z Z Z
+    |___|
+
+```
+
 
 
 ## Locking rules

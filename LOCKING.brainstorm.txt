@@ -1351,6 +1351,10 @@ Generic stuff I've learned so far:
 - Your locks should be as long-lasting as possible (cover as much lines as possible)
   for better understandability, as long as performance stays OK.
   Longer critical sections -> more code behaves like a single-threaded program.
+- Write validators for your locks. assert() the order in which the locks are
+  acquired, and which locks must be held when certain shared memory locations
+  are read.
+- https://www.cs.utexas.edu/~dahlin/professional/programming-with-threads.pdf
 
 
 ##############################################################################

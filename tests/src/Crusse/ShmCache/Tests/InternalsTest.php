@@ -37,7 +37,7 @@ class InternalsTest extends \PHPUnit\Framework\TestCase {
     $this->assertSame( false, @$this->cache->set( 'foo', str_repeat( 'x', $memory->MAX_VALUE_SIZE + 1 ) ) );
   }
 
-  function testRemoveOldestItemsWhenValueIsAreaFull() {
+  function testRemoveOldestItemsWithMaximumSizeChunks() {
 
     $memory = new \Crusse\ShmCache\Memory( self::CACHE_SIZE );
 
@@ -54,7 +54,7 @@ class InternalsTest extends \PHPUnit\Framework\TestCase {
     }
   }
 
-  function testRemoveOldestItemsWhenMemoryIsFull() {
+  function testRemoveOldestItemsWithVaryingSizeChunks() {
 
     $memory = new \Crusse\ShmCache\Memory( self::CACHE_SIZE );
 

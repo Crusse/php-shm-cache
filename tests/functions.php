@@ -30,19 +30,19 @@ function mutex_test_func( $arg ) {
   return $arg;
 }
 
-function set_random_cache_values( $key ) {
+function set_cache_values( $key ) {
 
   $cache = new \Crusse\ShmCache;
-  $value = str_repeat( 'x', rand( 1, 1024 * 768 ) );
+  $value = str_repeat( 'x', 1024 * 384 );
   $cache->set( $key, $value );
 
   return $value;
 }
 
-function add_and_set_random_cache_values( $key ) {
+function add_and_set_cache_values( $key ) {
 
   $cache = new \Crusse\ShmCache;
-  $value = str_repeat( 'x', rand( 1, 1024 * 768 ) );
+  $value = str_repeat( 'x', 1024 * 384 );
   $cache->add( $key, $value );
   $cache->set( $key, $value );
 

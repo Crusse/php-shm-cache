@@ -27,7 +27,7 @@ class Memory {
   const MAX_KEY_LENGTH = 200;
   // The more hash table buckets there are, the more memory is used, but the
   // faster it is to find a hash table entry
-  const HASH_BUCKET_COUNT = 512;
+  const HASH_BUCKET_COUNT = 5; // TODO FIXME
   // Used to resolve deadlocks
   const TRYLOCK_TIMEOUT = 3;
 
@@ -44,6 +44,7 @@ class Memory {
   public $zonesArea; // MemoryArea
 
   private $statsProto; // ShmBackedObject
+  private $hashBucketProto; // ShmBackedObject
   private $zoneMetaProto; // ShmBackedObject
   private $chunkProto; // ShmBackedObject
 
@@ -112,68 +113,192 @@ class Memory {
     return unpack( 'L', hash( 'crc32', $key, true ) )[ 1 ] % self::HASH_BUCKET_COUNT;
   }
 
-  /**
-   * These are our objects that we store in the whole shared memory block. See
-   * LOCKING.md for the locks that you need to hold to read/write any of these
-   * object's properties.
-   */
-  private function defineShmObjectPrototypes() {
-
-    $this->statsProto = ShmBackedObject::createPrototype( $this->statsArea, [
-      'gethits' => [
-        'size' => $this->LONG_SIZE,
-        'packformat' => 'l',
-        'requiredlocks' => [ 'stats' ],
-      ],
-      'getmisses' => [
-        'size' => $this->LONG_SIZE,
-        'packformat' => 'l',
-        'requiredlocks' => [ 'stats' ],
-      ],
-    ] );
-
-    $this->zoneMetaProto = ShmBackedObject::createPrototype( $this->zonesArea, [
-      'usedspace' => [
-        'size' => $this->LONG_SIZE,
-        'packformat' => 'l',
-        'requiredlocks' => [ 'zone' ],
-      ],
-    ] );
-
-    $this->chunkProto = ShmBackedObject::createPrototype( $this->zonesArea, [
-      'key' => [
-        'size' => self::MAX_KEY_LENGTH,
-        'packformat' => 'A'. self::MAX_KEY_LENGTH,
-        // TODO
-        'requiredlocks' => [ /* ??? 'bucket' ??? , */ 'zone' ],
-      ],
-      'hashnext' => [
-        'size' => $this->LONG_SIZE,
-        'packformat' => 'l',
-        'requiredlocks' => [ 'bucket', 'zone' ],
-      ],
-      'valallocsize' => [
-        'size' => $this->LONG_SIZE,
-        'packformat' => 'l',
-        'requiredlocks' => [ 'zone' ],
-      ],
-      'valsize' => [
-        'size' => $this->LONG_SIZE,
-        'packformat' => 'l',
-        'requiredlocks' => [ 'zone' ],
-      ],
-      'flags' => [
-        'size' => $this->CHAR_SIZE,
-        'packformat' => 'c',
-        'requiredlocks' => [ 'zone' ],
-      ],
-    ] );
-  }
-
   function __destruct() {
 
     if ( $this->shm )
       shmop_close( $this->shm );
+  }
+
+  function getZoneUsageDump() {
+
+    // Exclusive lock on the whole memory
+    if ( !$this->locks::$everything->lockForWrite() ) {
+      trigger_error( 'Could not acquire exclusive lock on the whole memory block' );
+      return '';
+    }
+
+    $this->locks::$oldestZoneIndex->lockForRead();
+
+    $oldestZoneIndex = $this->getOldestZoneIndex();
+    $ret = '';
+
+    try {
+      for ( $i = 0; $i < $this->ZONE_COUNT; $i++ ) {
+
+        $zoneMeta = $this->getZoneMetaByIndex( $i );
+
+        $ret .= str_pad( 'Zone '. $i , 12 );
+
+        $chunk = $this->getChunkByOffset( $zoneMeta->_endOffset );
+        $lastPossibleChunkOffset = $this->lastAllowedChunkOffsetInZone( $zoneMeta );
+
+        while ( true ) {
+
+          $zoneLock = $this->locks->getZoneLock( $i );
+          $zoneLock->lockForRead();
+          $bucketIndex = self::getBucketIndex( $chunk->key );
+          $zoneLock->releaseRead();
+
+          $bucketLock = $this->locks->getBucketLock( $bucketIndex );
+
+          // Try-lock. We should get this on first try because we have the
+          // exclusive "everything" lock.
+          if ( !$bucketLock->lockForRead( true ) )
+            throw new \Exception( 'Could not lock bucket' );
+
+          $bucket = $this->getBucketByIndex( $bucketIndex );
+          $chunkFoundInHashTable = false;
+
+          // Try to find $chunk in the hash table
+          if ( $bucket->headchunkoffset ) {
+
+            $bucketChunk = $this->getChunkByOffset( $bucket->headchunkoffset );
+
+            while ( !$chunkFoundInHashTable ) {
+
+              if ( $bucketChunk->_startOffset === $chunk->_startOffset ) {
+                $chunkFoundInHashTable = true;
+                break;
+              }
+
+              $zoneLock = $this->locks->getZoneLock( $this->getZoneIndexForOffset( $bucketChunk->_startOffset ) );
+              $zoneLock->lockForRead();
+              $hashNext = $bucketChunk->hashnext;
+              $zoneLock->releaseRead();
+
+              if ( !$hashNext )
+                break;
+
+              $bucketChunk = $this->getChunkByOffset( $hashNext );
+            }
+          }
+
+          $bucketLock->releaseRead();
+
+          $zoneLock = $this->locks->getZoneLock( $i );
+          $zoneLock->lockForRead();
+
+          $freeChunkOffset = $this->getZoneFreeChunkOffset( $zoneMeta );
+
+          if ( $chunk->_startOffset === $freeChunkOffset )
+            $ret .= '|';
+
+          if ( $chunk->valsize ) {
+            if ( $chunkFoundInHashTable ) {
+              if ( strlen( $chunk->key ) )
+                $ret .= 'x'; // Non-free chunk
+              else
+                $ret .= '!'; // This is an error -- the chunk is not free but it has no key
+            }
+            else {
+              $ret .= '?'; // This is an error -- this chunk should be found in the bucket
+            }
+          }
+          else {
+            $ret .= '.'; // Free chunk
+          }
+
+          $nextChunkOffset = $chunk->_endOffset + $chunk->valallocsize;
+          $zoneLock->releaseRead();
+
+          if ( $nextChunkOffset > $lastPossibleChunkOffset )
+            break;
+
+          $chunk = $this->getChunkByOffset( $nextChunkOffset );
+        }
+
+        if ( $i === $oldestZoneIndex )
+          $ret .= ' (oldest zone index)';
+
+        $ret .= PHP_EOL;
+      }
+    }
+    catch ( \Exception $e ) {
+      error_log( $e->getMessage() );
+    }
+
+    $this->locks::$oldestZoneIndex->releaseRead();
+    $this->locks::$everything->releaseWrite();
+
+    return $ret;
+  }
+
+  function getBucketUsageDump() {
+
+    // Exclusive lock on the whole memory
+    if ( !$this->locks::$everything->lockForWrite() ) {
+      trigger_error( 'Could not acquire exclusive lock on the whole memory block' );
+      return '';
+    }
+
+    $ret = '';
+
+    try {
+      for ( $i = 0; $i < self::HASH_BUCKET_COUNT; $i++ ) {
+
+        $bucketLock = $this->locks->getBucketLock( $i );
+        if ( !$bucketLock->lockForRead() )
+          break;
+
+        $bucket = $this->getBucketByIndex( $i );
+
+        // Skip empty buckets altogether for less verbose output
+        if ( !$bucket->headchunkoffset ) {
+          $bucketLock->releaseRead();
+          continue;
+        }
+
+        $ret .= str_pad( 'Bucket '. $i, 12 );
+
+        $chunk = $this->getChunkByOffset( $bucket->headchunkoffset );
+
+        while ( true ) {
+
+          $zoneLock = $this->locks->getZoneLock( $this->getZoneIndexForOffset( $chunk->_startOffset ) );
+          if ( !$zoneLock->lockForRead() )
+            break;
+
+          if ( $chunk->valsize ) {
+            if ( strlen( $chunk->key ) )
+              $ret .= 'x';
+            else
+              $ret .= '!'; // This is an error -- the chunk is not free but it has no key
+          }
+          else {
+            $ret .= '?'; // This is an error -- the hash table contains a freed chunk
+          }
+
+          $nextChunkOffset = $chunk->hashnext;
+          $zoneLock->releaseRead();
+
+          if ( !$nextChunkOffset )
+            break;
+
+          $chunk = $this->getChunkByOffset( $nextChunkOffset );
+        }
+
+        $bucketLock->releaseRead();
+
+        $ret .= PHP_EOL;
+      }
+    }
+    catch ( \Exception $e ) {
+      error_log( $e->getMessage() );
+    }
+
+    $this->locks::$everything->releaseWrite();
+
+    return $ret;
   }
 
   function getStatsObject() {
@@ -312,9 +437,9 @@ class Memory {
     if ( $valueIsSerialized )
       $flags |= self::FLAG_SERIALIZED;
 
-    $freeChunk->key = $key;
     $freeChunk->flags = $flags;
     $freeChunk->hashnext = 0;
+    $freeChunk->key = $key;
     $freeChunk->valsize = $valueSize;
 
     if ( !$this->splitChunkForFreeSpace( $freeChunk ) )
@@ -602,11 +727,11 @@ class Memory {
       // Each zone starts out with a single chunk that takes up the whole space
       // of the zone
       $chunk = $this->getChunkByOffset( $i * self::ZONE_SIZE + $zoneMeta->_size );
-      $chunk->key = '';
-      $chunk->hashnext = 0;
       $chunk->valallocsize = $this->MAX_VALUE_SIZE;
       $chunk->valsize = 0;
       $chunk->flags = 0;
+      $chunk->hashnext = 0;
+      $chunk->key = '';
 
       assert( $zoneMeta->usedspace === 0 );
       assert( $chunk->valallocsize > 0 );
@@ -708,6 +833,7 @@ class Memory {
 
   /**
    * @return int A chunk offset relative to the zonesArea
+  // TODO: use hashBucketProto
    */
   private function getBucketHeadChunkOffset( $bucketIndex ) {
 
@@ -733,6 +859,7 @@ class Memory {
     return $chunkOffset;
   }
 
+  // TODO: use hashBucketProto
   private function setBucketHeadChunkOffset( $bucketIndex, $chunkOffset ) {
 
     assert( $bucketIndex >= 0 );
@@ -939,6 +1066,8 @@ class Memory {
             goto cleanup;
           }
 
+          usleep( rand( 1, 1000 ) );
+
           $zoneLock = $this->locks->getZoneLock( $zoneIndex );
 
           if ( !$zoneLock->lockForWrite() ) {
@@ -1004,11 +1133,11 @@ class Memory {
     if ( $leftOverSize >= $this->MIN_CHUNK_SIZE ) {
 
       $leftOverChunk = $this->getChunkByOffset( $chunk->_endOffset + $valSize );
-      $leftOverChunk->key = '';
-      $leftOverChunk->hashnext = 0;
       $leftOverChunk->valallocsize = $leftOverSize - $this->CHUNK_META_SIZE;
       $leftOverChunk->valsize = 0;
       $leftOverChunk->flags = 0;
+      $leftOverChunk->hashnext = 0;
+      $leftOverChunk->key = '';
 
       assert( $leftOverChunk->valallocsize > 0 );
       assert( $leftOverChunk->valallocsize <= $this->MAX_VALUE_SIZE );
@@ -1049,6 +1178,12 @@ class Memory {
     }
 
     return true;
+  }
+
+  private function getBucketByIndex( $bucketIndex ) {
+    assert( $bucketIndex >= 0 );
+    assert( $bucketIndex < self::HASH_BUCKET_COUNT );
+    return $this->hashBucketProto->createInstance( $bucketIndex * $this->LONG_SIZE );
   }
 
   private function getZoneMetaByIndex( $zoneIndex ) {
@@ -1116,6 +1251,71 @@ class Memory {
 
   private function lastAllowedChunkOffsetInZone( ShmBackedObject $zoneMeta ) {
     return $zoneMeta->_startOffset + self::ZONE_SIZE - $this->MIN_CHUNK_SIZE;
+  }
+
+  /**
+   * These are our objects that we store in the whole shared memory block. See
+   * LOCKING.md for the locks that you need to hold to read/write any of these
+   * object's properties.
+   */
+  private function defineShmObjectPrototypes() {
+
+    $this->statsProto = ShmBackedObject::createPrototype( $this->statsArea, [
+      'gethits' => [
+        'size' => $this->LONG_SIZE,
+        'packformat' => 'l',
+        'requiredlocks' => [ 'stats' ],
+      ],
+      'getmisses' => [
+        'size' => $this->LONG_SIZE,
+        'packformat' => 'l',
+        'requiredlocks' => [ 'stats' ],
+      ],
+    ] );
+
+    $this->hashBucketProto = ShmBackedObject::createPrototype( $this->hashBucketArea, [
+      'headchunkoffset' => [
+        'size' => $this->LONG_SIZE,
+        'packformat' => 'l',
+        'requiredlocks' => [ 'bucket' ],
+      ],
+    ] );
+
+    $this->zoneMetaProto = ShmBackedObject::createPrototype( $this->zonesArea, [
+      'usedspace' => [
+        'size' => $this->LONG_SIZE,
+        'packformat' => 'l',
+        'requiredlocks' => [ 'zone' ],
+      ],
+    ] );
+
+    $this->chunkProto = ShmBackedObject::createPrototype( $this->zonesArea, [
+      'key' => [
+        'size' => self::MAX_KEY_LENGTH,
+        'packformat' => 'A'. self::MAX_KEY_LENGTH,
+        'requiredlocks' => [ 'bucket:write', 'zone' ],
+      ],
+      'hashnext' => [
+        'size' => $this->LONG_SIZE,
+        'packformat' => 'l',
+        'requiredlocks' => [ 'bucket', 'zone' ],
+      ],
+      'valallocsize' => [
+        'size' => $this->LONG_SIZE,
+        'packformat' => 'l',
+        'requiredlocks' => [ 'zone' ],
+      ],
+      'valsize' => [
+        'size' => $this->LONG_SIZE,
+        'packformat' => 'l',
+        'requiredlocks' => [ 'zone' ],
+      ],
+      'flags' => [
+        'size' => $this->CHAR_SIZE,
+        'packformat' => 'c',
+        'requiredlocks' => [ 'zone' ],
+      ],
+    ] );
   }
 }
 

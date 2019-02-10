@@ -2,25 +2,46 @@
 
 namespace Crusse\ShmCache\Tests;
 
+require_once __DIR__ .'/../../../../functions.php';
+
 class ParallelismTest extends \PHPUnit\Framework\TestCase {
 
   const PARALLEL_WORKERS = 6;
   const WORKER_TIMEOUT = 5;
-  const WORKER_JOBS = 100;
-  const ITERATIONS = 30;
+  const WORKER_JOBS = 200;
+  const ITERATIONS = 20;
+  const CACHE_SIZE = 16777216;
 
   private $cache;
+  private $memory;
   private $server;
 
   // Run before each test method
   function setUp() {
+    // Fail on infinite loops or failure to acquire locks
+    set_time_limit( 30 );
 
-    $this->cache = new \Crusse\ShmCache( 16 * 1024 * 1024 );
+    // Destroy the cache to delete any previous shared memory block created by
+    // ShmCache, so that we can be sure ShmCache creates a memory block of
+    // CACHE_SIZE
+    $cache = new \Crusse\ShmCache( self::CACHE_SIZE );
+    $this->assertSame( true, $cache->destroy() );
+
+    $this->cache = new \Crusse\ShmCache( self::CACHE_SIZE );
+    $this->memory = new \Crusse\ShmCache\Memory( self::CACHE_SIZE );
+
     $this->assertSame( true, $this->cache->flush() );
+
+    // Sanity check to make sure our memory is actually 16 MB, and not a much
+    // larger size due to an earlier ShmCache instantiaton, as ShmCache uses
+    // the largest shared memory size ever reserved
+    $this->assertLessThanOrEqual( self::CACHE_SIZE, $this->memory->SHM_SIZE );
   }
 
   function tearDown() {
     $this->assertSame( true, $this->cache->destroy() );
+    unset( $this->memory );
+    unset( $this->cache );
   }
 
   function testParallelSetOfDifferentKeys() {
@@ -37,7 +58,7 @@ class ParallelismTest extends \PHPUnit\Framework\TestCase {
       $server->setWorkerTimeout( self::WORKER_TIMEOUT );
 
       for ( $i = 0; $i < self::WORKER_JOBS; $i++ ) {
-        $server->addJob( 'add_and_set_random_cache_values', 'job'. $i );
+        $server->addJob( 'add_and_set_cache_values', 'job'. $i );
       }
 
       // Run the background jobs. Note that the JobServer logs background
@@ -53,12 +74,15 @@ class ParallelismTest extends \PHPUnit\Framework\TestCase {
 
       // We only expect to see the last few cache items due to limited size in
       // the cache (earlier items were flushed out of the way of later items)
-      $expectToSeeThisMany = 5;
 
-      for ( $i = self::WORKER_JOBS - 1, $j = 0; $j < $expectToSeeThisMany; $i--, $j++ ) {
+      for ( $i = 0; $i < self::WORKER_JOBS; $i++ ) {
         $jobValue = $res[ $i ];
         $cacheValue = $this->cache->get( 'job'. $i );
-        $this->assertSame( true, $jobValue === $cacheValue, 'See /var/log/syslog for errors; the cache item "job'. $i .'" value is incorrect: '. var_export( $cacheValue, true ) );
+
+        if ( $cacheValue !== false ) {
+          $this->assertSame( true, $jobValue === $cacheValue, 'See /var/log/syslog for errors; the cache item "job'. $i .'" value is incorrect: '. var_export( $cacheValue, true ) . PHP_EOL . PHP_EOL . $this->memory->getZoneUsageDump() . $this->memory->getBucketUsageDump() );
+          $valueCount++;
+        }
       }
     }
   }
@@ -66,7 +90,7 @@ class ParallelismTest extends \PHPUnit\Framework\TestCase {
   function testParallelSetOfIdenticalKeys() {
 
     $handleWorkerResult = function( $result, $jobNumber, $total ) {
-      $this->assertEquals( true, preg_match( '#^x+$#', $this->cache->get( 'identicalkey' ) ), 'See /var/log/syslog for errors' );
+      $this->assertEquals( true, preg_match( '#^x+$#', $this->cache->get( 'identicalkey' ) ), 'See /var/log/syslog for errors' . PHP_EOL . PHP_EOL . $this->memory->getZoneUsageDump() );
     };
 
     // Iterate the test many times for a better chance to hit a possible
@@ -81,7 +105,7 @@ class ParallelismTest extends \PHPUnit\Framework\TestCase {
       $server->setWorkerTimeout( self::WORKER_TIMEOUT );
 
       for ( $i = 0; $i < self::WORKER_JOBS; $i++ ) {
-        $server->addJob( 'set_random_cache_values', 'identicalkey' );
+        $server->addJob( 'set_cache_values', 'identicalkey' );
       }
 
       // Run the background jobs. Note that the JobServer logs background
@@ -91,7 +115,7 @@ class ParallelismTest extends \PHPUnit\Framework\TestCase {
         $server->getResults( $handleWorkerResult );
       }
       catch ( \Exception $e ) {
-        error_log( 'See /var/log/syslog for errors' );
+        error_log( 'See /var/log/syslog for errors' . PHP_EOL . PHP_EOL . $this->memory->getZoneUsageDump() );
         throw $e;
       }
     }

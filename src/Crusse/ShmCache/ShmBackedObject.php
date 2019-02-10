@@ -145,27 +145,56 @@ class ShmBackedObject {
     if ( !self::$locks::$everything->isLockedForRead() )
       throw new \Exception( 'All read and write operations require the "everything" lock' );
 
-    if ( in_array( 'bucket', $this->_properties[ $propName ][ 'requiredlocks' ] ) ) {
+    $requiredLocks = [];
 
+    // $lockName can look like "bucket" or "bucket:write".
+    // If it looks like "bucket", then it's implied that a bucket lock is
+    // required for both reads and writes.
+    // If it looks like "bucket:write", then a bucket lock is required only
+    // during writes, but not during reads.
+    foreach ( $this->_properties[ $propName ][ 'requiredlocks' ] as $lockName ) {
+
+      if ( preg_match( '#:write$#', $lockName ) ) {
+        if ( $writing )
+          $requiredLocks[] = preg_replace( '#:write$#', '', $lockName );
+      }
+      else {
+        $requiredLocks[] = preg_replace( '#:(read|write)$#', '', $lockName );
+      }
+    }
+
+    if ( in_array( 'bucket', $requiredLocks ) ) {
+
+      $bucketIndex = -1;
+      $key = '';
+
+      // This ShmBackedObject is a 'hashBucket' object
+      if ( isset( $this->_properties[ 'headchunkoffset' ] ) ) {
+
+        $bucketIndex = (int) ( $this->_startOffset / $this->_size );
+      }
       // This ShmBackedObject is a 'chunk' object
-      if ( isset( $this->_properties[ 'key' ] ) ) {
+      else if ( isset( $this->_properties[ 'key' ] ) ) {
         $key = $this->readProperty( 'key' );
 
-        // Only require a bucket lock if the key exists, i.e. the chunk is not free
-        if ( strlen( $key ) ) {
-          $lock = self::$locks->getBucketLock( Memory::getBucketIndex( $key ) );
-          $hasLock = ( $writing )
-            ? $lock->isLockedForWrite()
-            : $lock->isLockedForRead();
+        // Only require a bucket lock if the key exists and the chunk is not free
+        if ( strlen( $key ) && $this->readProperty( 'valsize' ) )
+          $bucketIndex = Memory::getBucketIndex( $key );
+      }
 
-          if ( !$hasLock ) {
-            throw new \Exception( 'The correct bucket lock is not held for "'. $key .'"->"'. $propName .'" (writing: '. var_export( $writing, true ) .')' );
-          }
+      if ( $bucketIndex > -1 ) {
+        $lock = self::$locks->getBucketLock( $bucketIndex );
+        $hasLock = ( $writing )
+          ? $lock->isLockedForWrite()
+          : $lock->isLockedForRead();
+
+        if ( !$hasLock ) {
+          throw new \Exception( 'The correct bucket lock (bucket '. $bucketIndex .') is not held for "'. $propName .'" (writing: '. var_export( $writing, true ) .', key: "'. $key .'"). Locks held: '. var_export( Lock::$lockCountPerTag, true ) );
         }
       }
     }
 
-    if ( in_array( 'zone', $this->_properties[ $propName ][ 'requiredlocks' ] ) ) {
+    if ( in_array( 'zone', $requiredLocks ) ) {
 
       $zoneIndex = (int) floor( $this->_startOffset / Memory::ZONE_SIZE );
       $lock = self::$locks->getZoneLock( $zoneIndex );
@@ -174,11 +203,11 @@ class ShmBackedObject {
         : $lock->isLockedForRead();
 
       if ( !$hasLock ) {
-        throw new \Exception( 'The correct zone lock is not held for "'. $propName .'" (writing: '. var_export( $writing, true ) .')' );
+        throw new \Exception( 'The correct zone lock (zone '. $zoneIndex .') is not held for "'. $propName .'" (writing: '. var_export( $writing, true ) .'). Locks held: '. var_export( Lock::$lockCountPerTag, true ) );
       }
     }
 
-    if ( in_array( 'stats', $this->_properties[ $propName ][ 'requiredlocks' ] ) ) {
+    if ( in_array( 'stats', $requiredLocks ) ) {
       $hasLock = false;
 
       if ( ( $writing && self::$locks::$stats->isLockedForWrite() ) ||
@@ -188,7 +217,7 @@ class ShmBackedObject {
       }
 
       if ( !$hasLock ) {
-        throw new \Exception( 'The correct stats lock is not held for "'. $propName .'" (writing: '. var_export( $writing, true ) .')' );
+        throw new \Exception( 'The correct stats lock is not held for "'. $propName .'" (writing: '. var_export( $writing, true ) .'). Locks held: '. var_export( Lock::$lockCountPerTag, true ) );
       }
     }
   }
